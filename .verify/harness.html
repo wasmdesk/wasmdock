@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>wasmdock harness</title>
+<style>body{margin:0;background:#3a5a8c}#c{display:block}</style>
+</head>
+<body>
+<!-- A desktop-colored backdrop so the dock's translucency/transparency reads. -->
+<canvas id="c" width="480" height="120"></canvas>
+<script src="../wasm_exec.js"></script>
+<script>
+// Standalone harness: stand in for the wasmbox compositor so we can drive the
+// dock's pure scene through its real wasm main() and capture the surface.
+//
+// We deliberately use a plain ArrayBuffer-backed Uint8ClampedArray (NOT a
+// SharedArrayBuffer) so the page needs no COOP/COEP headers — main.go only
+// calls CopyBytesToJS into `pixels`, which works on any typed array. This
+// exercises the real Render path; only the transport differs.
+"use strict";
+window.__launches = [];
+
+const W = 480, H = 120;
+const pixels = new Uint8ClampedArray(4 * W * H);
+
+// Minimal stub of the SDK client surface main.go reads.
+let inputCb = null;
+const client = {
+  w: W, h: H, pixels: pixels, windowId: 1,
+  commit: function () { window.__committed = (window.__committed | 0) + 1; },
+  onInput: function (fn) { inputCb = fn; window.__inputReady = true; },
+};
+window.wasmboxClient = client;
+
+// Capture launch messages the dock posts (worker would postMessage to host).
+const realPost = window.postMessage.bind(window);
+window.postMessage = function (msg, origin) {
+  if (msg && msg.type === "launch") window.__launches.push(msg.app);
+  return realPost(msg, origin || "*");
+};
+
+function blit() {
+  const ctx = document.getElementById("c").getContext("2d");
+  const img = new ImageData(new Uint8ClampedArray(pixels), W, H);
+  // Paint over the desktop backdrop with alpha compositing.
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#3a5a8c";
+  ctx.fillRect(0, 0, W, H);
+  ctx.putImageData(img, 0, 0); // putImageData ignores existing pixels, but
+  // the dock's transparent corners have alpha 0 → show as the cleared canvas
+  // when we composite manually below. To honor alpha, draw via a temp canvas:
+  const tmp = document.createElement("canvas");
+  tmp.width = W; tmp.height = H;
+  tmp.getContext("2d").putImageData(img, 0, 0);
+  ctx.fillStyle = "#3a5a8c";
+  ctx.fillRect(0, 0, W, H);
+  ctx.drawImage(tmp, 0, 0); // drawImage DOES alpha-composite
+  window.__blitted = true;
+}
+
+// Boot the real dock wasm.
+const go = new Go();
+WebAssembly.instantiateStreaming(fetch("../dock.wasm"), go.importObject)
+  .then((res) => {
+    go.run(res.instance);            // main() renders once + registers onInput
+    setTimeout(() => {
+      blit();                        // capture the resting dock
+      // Drive a mousemove over icon 1 to trigger magnification, then a click.
+      if (inputCb) {
+        inputCb({ kind: "mousemove", x: 240, y: 95 });
+        blit();
+        inputCb({ kind: "mousedown", x: 240, y: 95 });
+      }
+      window.__done = true;
+    }, 150);
+  })
+  .catch((e) => { window.__error = String(e); });
+</script>
+</body>
+</html>

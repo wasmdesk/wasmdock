@@ -1,0 +1,50 @@
+# Taskfile for wasmdock — https://taskfile.dev
+version: "3"
+
+silent: true
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build dock.wasm (GOOS=js GOARCH=wasm) and copy wasm_exec.js
+    env:
+      GOWORK: off
+      GOOS: js
+      GOARCH: wasm
+      CGO_ENABLED: "0"
+    cmds:
+      - go build -o dock.wasm .
+      - |
+        root="$(go env GOROOT)"
+        if [ -f "$root/lib/wasm/wasm_exec.js" ]; then
+          cp "$root/lib/wasm/wasm_exec.js" ./wasm_exec.js
+        elif [ -f "$root/misc/wasm/wasm_exec.js" ]; then
+          cp "$root/misc/wasm/wasm_exec.js" ./wasm_exec.js
+        else
+          echo "wasm_exec.js not found under $root/{lib,misc}/wasm/" >&2
+          exit 1
+        fi
+      - echo "built dock.wasm + wasm_exec.js"
+
+  test:
+    desc: Run the unit tests (pure scene package)
+    env:
+      GOWORK: off
+    cmds:
+      - go test ./...
+
+  cover:
+    desc: Report internal/scene coverage
+    env:
+      GOWORK: off
+    cmds:
+      - go test ./internal/scene -cover
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -f dock.wasm wasm_exec.js
