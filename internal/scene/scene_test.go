@@ -149,6 +149,48 @@ func TestHitTest(t *testing.T) {
 	}
 }
 
+// TestClickAtIconCenterDispatchesExpectedAppId is the table-driven contract
+// the wasmdock main loop relies on: a mousedown at icon i's center must
+// produce launch(state.Apps[i].Id), and that Id must match the expected
+// dock-protocol string ("terminal" / "editor" / "files"). This pins the chain
+//
+//	click -> HitTest -> state.Apps[i].Id -> {type:"launch", app: Id}
+//
+// without bringing up the wasm worker.
+func TestClickAtIconCenterDispatchesExpectedAppId(t *testing.T) {
+	cases := []struct{ wantID string }{
+		{"terminal"},
+		{"editor"},
+		{"files"},
+	}
+	s := New(tW, tH)
+	if got, want := len(s.Apps), len(cases); got != want {
+		t.Fatalf("default apps count = %d, want %d", got, want)
+	}
+	for i, c := range cases {
+		ix, iy, iw, ih := s.IconRect(i)
+		px := ix + iw/2
+		py := iy + ih/2
+		hit := s.HitTest(px, py)
+		if hit != i {
+			t.Fatalf("HitTest icon %d center = %d, want %d", i, hit, i)
+		}
+		got := s.Apps[hit].Id
+		if got != c.wantID {
+			t.Fatalf("click on icon %d dispatches %q, want %q", i, got, c.wantID)
+		}
+	}
+}
+
+// A mousedown that misses every icon (top-left corner of the surface) must
+// return -1 so the wasmdock main loop dispatches nothing.
+func TestClickOutsideAnyIconDispatchesNothing(t *testing.T) {
+	s := New(tW, tH)
+	if got := s.HitTest(2, 2); got != -1 {
+		t.Fatalf("HitTest off-icon = %d, want -1", got)
+	}
+}
+
 // IconRect for a magnified icon must be larger than the resting base.
 func TestIconRectMagnifiedLarger(t *testing.T) {
 	s := New(tW, tH)
