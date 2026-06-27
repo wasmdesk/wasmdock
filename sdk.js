@@ -145,6 +145,16 @@
       g.postMessage({ type: "set_workspace", index: index | 0 });
     }
 
+    // setTheme asks the compositor to switch the active Openbox theme to
+    // `name` (one of the bundled theme names — currently "Fluxbox Light",
+    // "Fluxbox Dark", "GNOME Adwaita"). The compositor drops unknown names
+    // and broadcasts a `theme_changed` input event back to every panel on
+    // success (carrying both the name and the full .themerc source). Fire-
+    // and-forget.
+    setTheme(name) {
+      g.postMessage({ type: "set_theme", name: String(name) });
+    }
+
     // --- internals -------------------------------------------------------
     _handle(msg) {
       if (!msg || typeof msg.type !== "string") return;
