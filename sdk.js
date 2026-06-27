@@ -136,6 +136,15 @@
       g.postMessage({ type: "close", window_id: id | 0 });
     }
 
+    // setWorkspace asks the compositor to switch the active workspace to
+    // `index` (1..workspaceCount, currently 4). The compositor drops
+    // out-of-range or already-active indices and broadcasts a
+    // `workspace_changed` input event back to every panel on success.
+    // Fire-and-forget.
+    setWorkspace(index) {
+      g.postMessage({ type: "set_workspace", index: index | 0 });
+    }
+
     // --- internals -------------------------------------------------------
     _handle(msg) {
       if (!msg || typeof msg.type !== "string") return;
