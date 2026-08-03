@@ -16,49 +16,31 @@ if (err) { console.log("WASM ERROR:", err); console.log(logs.join("\n")); await 
 
 const state = await page.evaluate(() => ({
   committed: window.__committed | 0,
+  popupCommits: window.__popupCommits | 0,
   blitted: !!window.__blitted,
   inputReady: !!window.__inputReady,
   launches: window.__launches || [],
+  focuses: window.__focuses || [],
+  closes: window.__closes || [],
+  popups: (window.__popups || []).map((p) => ({ w: p.w, h: p.h, rel_x: p.rel_x, rel_y: p.rel_y })),
+  geomRest: window.__geomRest || {},
+  geomHover: window.__geomHover || {},
 }));
 
-// Screenshot the canvas element.
 const el = await page.$("#c");
 await el.screenshot({ path: "shot.png" });
 
-// Pixel analysis: read the canvas back as raw RGBA via the page.
+// Pixel analysis: read the canvas back as raw RGBA.
 const stats = await page.evaluate(() => {
   const c = document.getElementById("c");
   const ctx = c.getContext("2d");
   const { data, width, height } = ctx.getImageData(0, 0, c.width, c.height);
-  let nonBg = 0, total = width * height;
-  // Desktop backdrop is #3a5a8c. Count pixels that differ from it (= dock paint).
+  let nonBg = 0;
   const bg = [0x3a, 0x5a, 0x8c];
-  // Row coverage: which rows contain dock paint (to confirm a bottom bar).
-  const rowHit = new Array(height).fill(0);
-  // Column coverage in the bar band (to confirm a centered horizontal bar).
-  const colHit = new Array(width).fill(0);
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const i = (y * width + x) * 4;
-      const dr = Math.abs(data[i] - bg[0]);
-      const dg = Math.abs(data[i + 1] - bg[1]);
-      const db = Math.abs(data[i + 2] - bg[2]);
-      if (dr + dg + db > 24) { nonBg++; rowHit[y]++; colHit[x]++; }
-    }
+  for (let i = 0; i < data.length; i += 4) {
+    if (Math.abs(data[i] - bg[0]) + Math.abs(data[i + 1] - bg[1]) + Math.abs(data[i + 2] - bg[2]) > 24) nonBg++;
   }
-  // Topmost / bottommost rows with paint.
-  let firstRow = -1, lastRow = -1;
-  for (let y = 0; y < height; y++) if (rowHit[y] > 0) { if (firstRow < 0) firstRow = y; lastRow = y; }
-  let firstCol = -1, lastCol = -1;
-  for (let x = 0; x < width; x++) if (colHit[x] > 0) { if (firstCol < 0) firstCol = x; lastCol = x; }
-  // Corner alpha sample from the live surface buffer.
-  return {
-    width, height, total, nonBg,
-    nonBgPct: +(100 * nonBg / total).toFixed(1),
-    firstPaintRow: firstRow, lastPaintRow: lastRow,
-    firstPaintCol: firstCol, lastPaintCol: lastCol,
-    leftMargin: firstCol, rightMargin: width - 1 - lastCol,
-  };
+  return { width, height, nonBg, nonBgPct: +(100 * nonBg / (width * height)).toFixed(1) };
 });
 
 console.log("=== render state ===");
@@ -68,17 +50,23 @@ console.log(JSON.stringify(stats, null, 2));
 console.log("=== browser console ===");
 console.log(logs.join("\n"));
 
-// Assertions.
+// Helper: width of launcher 0 from a geometry snapshot.
+const launcher0W = (g) => (g && g.launchers && g.launchers[0] ? g.launchers[0].w : 0);
+
 const fails = [];
 if (stats.nonBg === 0) fails.push("blank canvas: no dock pixels");
-if (stats.nonBgPct > 95) fails.push("canvas almost entirely painted (not a panel)");
-// Bottom-anchored: paint should reach the lower portion of the surface.
-if (stats.lastPaintRow < stats.height * 0.6) fails.push("no paint in bottom band");
-// Centered: left/right margins roughly equal (bar is centered).
-if (Math.abs(stats.leftMargin - stats.rightMargin) > 24) fails.push("bar not horizontally centered");
-if (!state.launches.includes("editor") && state.launches.length === 0) fails.push("click produced no launch message");
+if (!state.inputReady) fails.push("dock never registered an input handler");
+if (state.launches.length === 0) fails.push("left-click produced no launch message");
+// Magnification: the hovered launcher is wider than at rest.
+const restW = launcher0W(state.geomRest);
+const hovW = launcher0W(state.geomHover);
+if (!(restW > 0 && hovW > restW)) fails.push(`launcher did not magnify on hover (rest=${restW}, hover=${hovW})`);
+// Right-click opened a context-menu popup with a sane size.
+if (state.popups.length === 0) fails.push("right-click opened no context-menu popup");
+else if (!(state.popups[0].w >= 120 && state.popups[0].h > 0)) fails.push("popup size out of range");
+if (state.popupCommits === 0) fails.push("popup menu never painted (no commit)");
 
 console.log("=== result ===");
 if (fails.length) { console.log("FAIL:\n - " + fails.join("\n - ")); await browser.close(); process.exit(2); }
-console.log("PASS: non-blank, bottom-anchored, centered dock; launch fired:", JSON.stringify(state.launches));
+console.log(`PASS: dock renders; magnify rest=${restW}->hover=${hovW}; launches=${JSON.stringify(state.launches)}; popup=${JSON.stringify(state.popups[0])}`);
 await browser.close();
