@@ -7,10 +7,26 @@
 //
 // It allocates the surface SharedArrayBuffer, posts the initial `hello`, waits
 // for `welcome`, exposes a `commit(damage)` flusher, dispatches incoming
-// `input` events to a user-supplied callback, and adds a small `launch(app)`
-// helper for the dock's launch protocol extension (see INTEGRATION.md). If the
-// compositor does not implement `launch` yet, the message is simply ignored on
-// the host side — the dock keeps rendering.
+// `input` events to a user-supplied callback, and adds small `launch(app)` /
+// `focus` / `closeWindow` / `setWorkspace` / `setTheme` helpers for the dock's
+// protocol extensions (see INTEGRATION.md). If the compositor does not
+// implement one yet, the message is simply ignored host-side — the dock keeps
+// rendering.
+//
+// Channel (MessageChannel-direct):
+//   The compositor sends each freshly-spawned client a dedicated MessagePort
+//   as its very first message: `{type:"__wasmbox_port", port: <MessagePort>}`.
+//   The SDK swaps from the implicit `self.parent` channel to that port before
+//   any application traffic. All application sends BUFFER until the port is in
+//   place, then flush in FIFO order — so callers can `client.start()`
+//   synchronously at module load without racing the port handoff.
+//
+// Multiple surfaces per worker:
+//   A worker may own SEVERAL surfaces (the dock panel + a right-click menu
+//   popup), all multiplexed over the single port. `clients` is every started
+//   surface; `pendingWelcome` matches each `welcome` (which arrives in hello
+//   order) to the oldest un-welcomed surface, and every other message routes to
+//   the surface carrying its window_id. This is what makes openPopup work.
 //
 // See the wasmbox docs/protocol.md for the wire format.
 //
@@ -27,6 +43,65 @@
 "use strict";
 
 (function (g) {
+  // Channel: set once the compositor hands us a MessagePort. Until then,
+  // application sends (hello/commit/...) buffer in pendingSends.
+  let activeChannel = null;
+  // A worker may own SEVERAL surfaces (dock panel + popups). `clients` is every
+  // started surface; `pendingWelcome` is those awaiting their welcome (FIFO).
+  const clients = [];
+  const pendingWelcome = [];
+  // The worker's primary surface (first non-popup client) — bootWasm paints its
+  // progress bar here by default; popups never become the active client.
+  let activeClient = null;
+  const pendingSends = [];
+
+  function flushPending() {
+    while (pendingSends.length) {
+      const [msg, transfer] = pendingSends.shift();
+      if (transfer && transfer.length) activeChannel.postMessage(msg, transfer);
+      else                              activeChannel.postMessage(msg);
+    }
+  }
+
+  function send(msg, transfer) {
+    if (activeChannel) {
+      if (transfer && transfer.length) activeChannel.postMessage(msg, transfer);
+      else                              activeChannel.postMessage(msg);
+    } else {
+      pendingSends.push([msg, transfer]);
+    }
+  }
+
+  // One dispatcher for the whole worker. `welcome` is matched to the oldest
+  // un-welcomed surface (the compositor replies in hello order over an ordered
+  // port); every other message routes to the surface with that window_id.
+  function dispatch(ev) {
+    const m = ev && ev.data;
+    if (!m || typeof m.type !== "string") return;
+    if (m.type === "welcome") {
+      const c = pendingWelcome.shift();
+      if (c) c._applyWelcome(m);
+      return;
+    }
+    const c = clients.find((x) => x.windowId === m.window_id);
+    if (c) c._handle(m);
+  }
+
+  function swapChannel(port) {
+    if (!port || activeChannel === port) return;
+    port.addEventListener("message", dispatch);
+    try { port.start(); } catch (_) {}
+    activeChannel = port;
+    flushPending();
+  }
+
+  g.addEventListener("message", function bootPortHandler(ev) {
+    const m = ev.data;
+    if (!m || m.type !== "__wasmbox_port" || !m.port) return;
+    g.removeEventListener("message", bootPortHandler);
+    swapChannel(m.port);
+  });
+
   class WasmboxClient {
     constructor(opts) {
       const w = opts.w | 0;
@@ -34,31 +109,45 @@
       if (!w || !h) throw new Error("WasmboxClient requires positive w + h");
       this.title = opts.title || "client";
       this.role = opts.role || "window"; // dock requests the "panel" role
+      // Popups only: the parent window_id + parent-relative placement.
+      this.parent = (opts.parent != null) ? (opts.parent | 0) : null;
+      this.relX = opts.rel_x | 0;
+      this.relY = opts.rel_y | 0;
       this.w = w;
       this.h = h;
       this.stride = 4 * w;
       // 4 bytes per pixel (RGBA32), row-major, origin top-left.
       this.sab = new SharedArrayBuffer(this.stride * h);
       this.pixels = new Uint8ClampedArray(this.sab); // worker-side view
+      // Seqlock control word (one Int32 in a tiny shared buffer). Opened ODD by
+      // beginFrame() before the frame is copied into the SAB and closed EVEN by
+      // commit(); the compositor refuses to blit a surface whose seq is odd or
+      // changes mid-read, so a torn (half-copied) frame is never shown — matters
+      // for the dock's per-hover magnification repaints. Single writer here.
+      this.ctl = new SharedArrayBuffer(4);
+      this.seq = new Int32Array(this.ctl);
       this.windowId = null;
       this._welcomeCbs = [];
       this._inputCbs = [];
       this._closedCbs = [];
       // Buffer for input events that arrived BEFORE any onInput handler was
-      // attached. The Go side only calls onInput after its wasm boots, which
-      // can race a `windows_changed` snapshot the compositor posts in the
-      // welcome handler — without this buffer the initial snapshot would be
-      // silently dropped. Flushed (in FIFO order) by the first onInput()
-      // call.
+      // attached. The Go side of an external client only calls onInput after
+      // its wasm boots, which can race a `windows_changed` snapshot the
+      // compositor posts in the welcome handler — without this buffer the
+      // initial snapshot would be silently dropped. Flushed (FIFO) by the
+      // first onInput() call.
       this._pendingInputs = [];
-      this._onMessage = (e) => this._handle(e.data);
     }
 
+    get channel() { return activeChannel; }
+
     // Begin listening + post hello. Returns a Promise that resolves with the
-    // welcome payload (so the client can `await client.start()` and then paint).
+    // welcome payload (so the client can `await client.start()` and paint).
     start() {
-      g.addEventListener("message", this._onMessage);
-      g.postMessage({
+      clients.push(this);
+      pendingWelcome.push(this);
+      if (this.role !== "popup" && activeClient === null) activeClient = this;
+      const hello = {
         type: "hello",
         title: this.title,
         role: this.role, // panel role (compositor may ignore → defaults to window)
@@ -66,15 +155,20 @@
         h: this.h,
         sab: this.sab,
         stride: this.stride,
-      });
+        ctl: this.ctl,
+      };
+      if (this.parent !== null) {
+        hello.parent = this.parent; // popup: anchor to this parent window_id
+        hello.rel_x = this.relX;    // ...at this offset inside the parent body
+        hello.rel_y = this.relY;
+      }
+      send(hello);
       return new Promise((resolve) => this.onWelcome(resolve));
     }
 
     onWelcome(fn) { this._welcomeCbs.push(fn); }
     onInput(fn)   {
       this._inputCbs.push(fn);
-      // Drain any input events that arrived before the first onInput handler
-      // was attached — see _pendingInputs in the constructor.
       if (this._pendingInputs.length) {
         const queued = this._pendingInputs;
         this._pendingInputs = [];
@@ -87,101 +181,230 @@
     // surface.
     commit(damage) {
       if (this.windowId === null) return;
+      // Close the seqlock write window (odd -> even) so the compositor may read
+      // a complete frame. Only flips if beginFrame() opened it this frame.
+      if ((Atomics.load(this.seq, 0) & 1) === 1) Atomics.add(this.seq, 0, 1);
       const d = damage || { x: 0, y: 0, w: this.w, h: this.h };
-      g.postMessage({
-        type: "commit",
-        window_id: this.windowId,
-        damage: d,
-      });
+      send({ type: "commit", window_id: this.windowId, damage: d });
+    }
+
+    // Open the seqlock write window (even -> odd). The Go client calls this
+    // right before writing the frame into the SAB (js.CopyBytesToJS), so the
+    // compositor never blits a half-copied frame; commit() closes it. Idempotent
+    // within a frame.
+    beginFrame() {
+      if ((Atomics.load(this.seq, 0) & 1) === 0) Atomics.add(this.seq, 0, 1);
     }
 
     setTitle(title) {
       this.title = title;
       if (this.windowId === null) return;
-      g.postMessage({ type: "set_title", window_id: this.windowId, title: title });
+      send({ type: "set_title", window_id: this.windowId, title: title });
     }
 
     requestClose() {
       if (this.windowId === null) return;
-      g.postMessage({ type: "request_close", window_id: this.windowId });
+      send({ type: "request_close", window_id: this.windowId });
     }
 
     // launch asks the compositor to start another client. Protocol extension
     // (see INTEGRATION.md). Fire-and-forget: if the host has no handler the
     // message is dropped and the dock keeps working.
     launch(app) {
-      g.postMessage({ type: "launch", app: String(app) });
+      send({ type: "launch", app: String(app) });
     }
 
-    // restore asks the compositor to un-minimize a folded window. Kept as
-    // an alias of focus for backward compatibility with the existing wire
-    // protocol; the compositor's `:focus` arm now restores minimized
-    // windows on its own. Fire-and-forget.
+    // restore un-minimizes a folded window. Kept as an alias of focus for
+    // backward compatibility; the compositor's `:focus` arm now restores
+    // minimized windows on its own. Fire-and-forget.
     restore(id) {
-      g.postMessage({ type: "restore", window_id: id | 0 });
+      send({ type: "restore", window_id: id | 0 });
     }
 
-    // focus asks the compositor to raise + focus a window the user clicked
-    // on its iconbar button. If the window is minimized it is restored
-    // first. Fire-and-forget.
-    focus(id) {
-      g.postMessage({ type: "focus", window_id: id | 0 });
-    }
-
-    // closeWindow asks the compositor to close a window the user
-    // right-clicked on its iconbar button. Same effect as clicking the
-    // window's title-bar close box. Fire-and-forget. (Named closeWindow,
-    // not close, because `close()` is taken on the global Worker scope.)
-    closeWindow(id) {
-      g.postMessage({ type: "close", window_id: id | 0 });
-    }
-
-    // setWorkspace asks the compositor to switch the active workspace to
-    // `index` (1..workspaceCount, currently 4). The compositor drops
-    // out-of-range or already-active indices and broadcasts a
-    // `workspace_changed` input event back to every panel on success.
+    // focus raises + focuses a window (restoring it first if minimized).
     // Fire-and-forget.
-    setWorkspace(index) {
-      g.postMessage({ type: "set_workspace", index: index | 0 });
+    focus(id) {
+      send({ type: "focus", window_id: id | 0 });
     }
 
-    // setTheme asks the compositor to switch the active Openbox theme to
-    // `name` (one of the bundled theme names — currently "Fluxbox Light",
-    // "Fluxbox Dark", "GNOME Adwaita"). The compositor drops unknown names
-    // and broadcasts a `theme_changed` input event back to every panel on
-    // success (carrying both the name and the full .themerc source). Fire-
-    // and-forget.
+    // closeWindow closes a window (same effect as its title-bar close box).
+    // Fire-and-forget. (Named closeWindow, not close, because `close()` is taken
+    // on the global Worker scope.)
+    closeWindow(id) {
+      send({ type: "close", window_id: id | 0 });
+    }
+
+    // setWorkspace switches the active workspace to `index` (1..count). The
+    // compositor drops out-of-range / already-active indices and broadcasts a
+    // `workspace_changed` input event back on success. Fire-and-forget.
+    setWorkspace(index) {
+      send({ type: "set_workspace", index: index | 0 });
+    }
+
+    // setTheme switches the active Openbox theme by display name. The compositor
+    // drops unknown names and broadcasts a `theme_changed` input event on
+    // success. Fire-and-forget.
     setTheme(name) {
-      g.postMessage({ type: "set_theme", name: String(name) });
+      send({ type: "set_theme", name: String(name) });
+    }
+
+    // openPopup opens a child popup surface anchored at (rel_x, rel_y) inside
+    // this surface's body — the dock uses it for the right-click app context
+    // menu, which is far taller than the 28px bar can draw in-surface. The
+    // popup is undecorated, stacks just above its parent, takes mouse input via
+    // hit-testing, and the compositor grab-dismisses it (posts `closed`) on a
+    // click outside it. Returns the started child WasmboxClient — await its
+    // start() (or use onWelcome) before painting. Mirrors
+    // wasmbox/clients/sdk/sdk.js openPopup so the dock speaks the same popup
+    // protocol without a compositor change.
+    openPopup(opts) {
+      if (this.windowId === null) {
+        throw new Error("openPopup: call after the parent's welcome");
+      }
+      const popup = new WasmboxClient({
+        title: opts.title || (this.title + " menu"),
+        w: opts.w, h: opts.h,
+        role: "popup",
+        parent: this.windowId,
+        rel_x: opts.rel_x | 0,
+        rel_y: opts.rel_y | 0,
+      });
+      popup.start();
+      return popup;
+    }
+
+    // putPixel + fillRect: minimal SAB scribblers (kept in lockstep with the
+    // wasmbox SDK) used by bootWasm's loading progress bar.
+    putPixel(x, y, r, gr, b, a) {
+      if (x < 0 || y < 0 || x >= this.w || y >= this.h) return;
+      const off = (y * this.w + x) * 4;
+      this.pixels[off] = r;
+      this.pixels[off + 1] = gr;
+      this.pixels[off + 2] = b;
+      this.pixels[off + 3] = a;
+    }
+
+    fillRect(r, gr, b, a, rect) {
+      const x0 = rect ? Math.max(0, rect.x | 0) : 0;
+      const y0 = rect ? Math.max(0, rect.y | 0) : 0;
+      const x1 = rect ? Math.min(this.w, (rect.x + rect.w) | 0) : this.w;
+      const y1 = rect ? Math.min(this.h, (rect.y + rect.h) | 0) : this.h;
+      for (let y = y0; y < y1; y++) {
+        let off = (y * this.w + x0) * 4;
+        for (let x = x0; x < x1; x++) {
+          this.pixels[off++] = r;
+          this.pixels[off++] = gr;
+          this.pixels[off++] = b;
+          this.pixels[off++] = a;
+        }
+      }
     }
 
     // --- internals -------------------------------------------------------
+    _applyWelcome(msg) {
+      this.windowId = msg.window_id;
+      this.w = msg.granted_w | 0;
+      this.h = msg.granted_h | 0;
+      this.stride = 4 * this.w;
+      for (const fn of this._welcomeCbs) fn(msg);
+    }
+
     _handle(msg) {
       if (!msg || typeof msg.type !== "string") return;
       switch (msg.type) {
-        case "welcome":
-          this.windowId = msg.window_id;
-          this.w = msg.granted_w | 0;
-          this.h = msg.granted_h | 0;
-          this.stride = 4 * this.w;
-          for (const fn of this._welcomeCbs) fn(msg);
-          break;
         case "input":
           if (this._inputCbs.length) {
             for (const fn of this._inputCbs) fn(msg.event || {});
           } else {
-            // No onInput handler yet (wasm not booted) — buffer the event so
-            // the first onInput() call drains it. See _pendingInputs.
             this._pendingInputs.push(msg.event || {});
           }
           break;
         case "closed":
           for (const fn of this._closedCbs) fn(msg.reason || "user");
-          g.removeEventListener("message", this._onMessage);
+          // Drop this surface from dispatch; the shared port stays open for the
+          // worker's other surfaces (e.g. the dock panel after its menu goes).
+          const i = clients.indexOf(this);
+          if (i >= 0) clients.splice(i, 1);
           break;
       }
     }
   }
+
+  // Test seam: force the SDK onto a specific MessagePort. Real clients never
+  // call this — the port arrives via the `__wasmbox_port` handoff.
+  WasmboxClient.useMessagePort = function (port) { swapChannel(port); };
+
+  // ----- loading progress bar -------------------------------------------
+  // bootWasm(url, importObject, opts?) -> Promise<WebAssembly.Instance>.
+  // Paints an Adwaita-style progress bar onto the active client's SAB while the
+  // wasm downloads + instantiates, then resolves to the instance.
+  WasmboxClient.bootWasm = async function bootWasm(url, importObject, opts) {
+    opts = opts || {};
+    const bg    = opts.bg    || [250, 250, 250];
+    const track = opts.track || [218, 220, 224];
+    const fill  = opts.fill  || [ 53, 132, 228];
+    const fetchFn = ("fetch" in opts)
+      ? opts.fetch
+      : (g.fetch || (typeof fetch !== "undefined" ? fetch : null));
+    const instantiateFn = ("instantiate" in opts)
+      ? opts.instantiate
+      : (typeof WebAssembly !== "undefined" ? WebAssembly.instantiate.bind(WebAssembly) : null);
+    const client = (opts.client === undefined) ? activeClient : opts.client;
+
+    function paintBar(progress) {
+      if (!client) return;
+      const w = client.w, h = client.h;
+      const trackW = Math.min(200, Math.max(40, w - 32));
+      const trackH = 6;
+      const trackX = ((w - trackW) >> 1);
+      const trackY = ((h - trackH) >> 1);
+      client.fillRect(bg[0], bg[1], bg[2], 255);
+      client.fillRect(track[0], track[1], track[2], 255,
+        { x: trackX, y: trackY, w: trackW, h: trackH });
+      const p = Math.max(0, Math.min(1, progress));
+      const fillW = Math.round(trackW * p);
+      if (fillW > 0) {
+        client.fillRect(fill[0], fill[1], fill[2], 255,
+          { x: trackX, y: trackY, w: fillW, h: trackH });
+      }
+      client.commit();
+    }
+
+    if (!fetchFn) throw new Error("bootWasm: no fetch available");
+    if (!instantiateFn) throw new Error("bootWasm: no WebAssembly.instantiate available");
+
+    paintBar(0);
+    const resp = await fetchFn(url);
+    if (resp && resp.status && (resp.status < 200 || resp.status >= 300)) {
+      throw new Error("bootWasm: HTTP " + resp.status + " for " + url);
+    }
+    const cl = resp.headers && resp.headers.get ? +resp.headers.get("content-length") : 0;
+    const total = (Number.isFinite(cl) && cl > 0) ? cl : 0;
+    const chunks = [];
+    let received = 0;
+    if (resp.body && resp.body.getReader) {
+      const reader = resp.body.getReader();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value && value.length) {
+          chunks.push(value);
+          received += value.length;
+          paintBar(total > 0 ? received / total : 0.5);
+        }
+      }
+    } else {
+      const buf = await resp.arrayBuffer();
+      chunks.push(new Uint8Array(buf));
+      received = chunks[0].length;
+    }
+    const bytes = new Uint8Array(received || chunks.reduce((n, c) => n + c.length, 0));
+    let off = 0;
+    for (const c of chunks) { bytes.set(c, off); off += c.length; }
+    paintBar(1);
+    const result = await instantiateFn(bytes, importObject);
+    return (result && result.instance) ? result.instance : result;
+  };
 
   g.WasmboxClient = WasmboxClient;
 })(self);

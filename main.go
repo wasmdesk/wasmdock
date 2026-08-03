@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //
 // Command wasmdock is a Fluxbox-style bottom toolbar implemented as a
-// wasmbox external client. It paints a full-width, 28-pixel-tall bevelled
-// gray bar split into three sections — a workspace label, an iconbar of
-// launcher buttons, and a clock — into the SAB the SDK allocated for it,
-// and dispatches {type:"launch", app:"<id>"} to the compositor when an
-// iconbar button is clicked.
+// wasmbox external client. It paints a full-width bevelled gray bar split into
+// three sections — a workspace label, an iconbar of launcher buttons (with
+// macOS-style hover magnification, running/active indicators + attention
+// badges), and a clock — into the SAB the SDK allocated for it, and dispatches
+// {type:"launch"/"focus"/"close", ...} to the compositor on clicks. A
+// right-click on a launcher or window entry opens an application context menu
+// in a child popup surface.
 //
-// The pure scene + theme packages do all the layout, hit-testing and
-// painting; this file is the thin JS/SAB/postMessage glue. The worker.js
-// shell posts a "tick" input event every 30 seconds carrying the current
-// "HH:MM" string so the clock stays fresh without a Go-side time source
-// (the wasm runtime's clock is fine, but the toolbar reads the JS one for
-// timezone consistency with the rest of the page).
+// The pure scene + theme packages do all the layout, hit-testing and painting;
+// this file is the thin JS/SAB/postMessage glue. The worker.js shell posts a
+// "tick" input event every 30 seconds carrying the current "HH:MM" string so
+// the clock stays fresh.
 //
 //go:build js && wasm
 
@@ -26,6 +26,43 @@ import (
 	"github.com/wasmdesk/wasmdock/internal/scene"
 	"github.com/wasmdesk/wasmdock/internal/theme"
 )
+
+// hasMethod reports whether the JS value exposes a callable method `name`. The
+// standalone .verify harness stubs the client with only commit + onInput, so
+// every optional SDK method (beginFrame / openPopup / requestClose) is
+// feature-detected before use — a missing one degrades gracefully rather than
+// throwing.
+func hasMethod(v js.Value, name string) bool {
+	return v.Get(name).Type() == js.TypeFunction
+}
+
+// exposeGeometry publishes the dock's current launcher + window-button
+// rectangles (MAGNIFIED when the cursor hovers, so a probe clicks where the
+// button is actually painted) on a worker global for headless probes. Read via
+// worker.evaluate(() => globalThis.__wasmdockGeometry); the screen position of
+// a rect is (VIEW_W - w)/2 + x, (VIEW_H - h) + y (the dock is bottom-center
+// anchored). Cheap; refreshed on window changes + hover repaints.
+func exposeGeometry(state *scene.State) {
+	wr := state.WindowRects()
+	buttons := make([]interface{}, 0, len(wr))
+	for i, r := range wr {
+		w := state.Windows[i]
+		buttons = append(buttons, map[string]interface{}{
+			"id": w.Id, "title": w.Title, "minimized": w.Minimized,
+			"focused": w.Focused, "x": r[0], "y": r[1], "w": r[2], "h": r[3],
+		})
+	}
+	lr := state.LauncherRects()
+	launchers := make([]interface{}, 0, len(lr))
+	for i, r := range lr {
+		launchers = append(launchers, map[string]interface{}{
+			"id": state.Apps[i].Id, "x": r[0], "y": r[1], "w": r[2], "h": r[3],
+		})
+	}
+	js.Global().Set("__wasmdockGeometry", js.ValueOf(map[string]interface{}{
+		"w": state.W, "h": state.H, "buttons": buttons, "launchers": launchers,
+	}))
+}
 
 func main() {
 	client := js.Global().Get("wasmboxClient")
@@ -43,13 +80,19 @@ func main() {
 		return
 	}
 
-	// Pure-Go RGBA buffer; scene.Render fills it, then we copy once per
-	// frame into the SAB through the SDK's Uint8ClampedArray view.
+	// Pure-Go RGBA buffer; scene.Render fills it, then we copy once per frame
+	// into the SAB through the SDK's Uint8ClampedArray view.
 	local := make([]byte, 4*w*h)
 	state := scene.New(w, h)
 
 	render := func() {
 		scene.Render(state, local)
+		// Open the seqlock write window before copying the frame into the SAB
+		// so the compositor never blits a half-copied frame (matters for the
+		// per-hover magnification repaints). commit() closes it.
+		if hasMethod(client, "beginFrame") {
+			client.Call("beginFrame")
+		}
 		js.CopyBytesToJS(pixels, local)
 		damage := js.Global().Call("Object")
 		damage.Set("x", 0)
@@ -59,51 +102,16 @@ func main() {
 		client.Call("commit", damage)
 	}
 
-	// launch asks the compositor to start another client. The launch
-	// message MUST travel over the SDK's MessagePort (the per-client wire
-	// the compositor listens on for `wasmbox-msg`), not over
-	// `self.postMessage` (the implicit nested-worker channel to
-	// compositor.worker.js, which only handles main<->compositor boot
-	// traffic and silently drops application messages like `launch`).
-	launch := func(app string) {
-		println("wasmdock: launch", app)
-		client.Call("launch", app)
-	}
+	launch := func(app string) { client.Call("launch", app) }
+	focusWin := func(id int) { client.Call("focus", id) }
 
-	// focus asks the compositor to raise + focus a window the user
-	// left-clicked on its iconbar button. Travels over the SDK's MessagePort
-	// just like `launch`; the compositor's WindowManager.handle_client_message
-	// routes the message to its `:focus` arm — which also restores the window
-	// first if it was minimized, matching Fluxbox semantics (one click on an
-	// iconbar entry brings the window to the foreground). The compositor then
-	// pushes a refreshed window list back through `windows_changed`.
-	focusWin := func(id int) {
-		println("wasmdock: focus", id)
-		client.Call("focus", id)
-	}
+	// setWorkspace asks the compositor to switch the active workspace.
+	setWorkspace := func(index int) { client.Call("setWorkspace", index) }
 
-	// closeWin asks the compositor to close a window the user right-clicked
-	// on its iconbar button. Same effect as clicking the window's title-bar
-	// close box. Fire-and-forget; the compositor drops the message for an
-	// unknown or panel id.
-	closeWin := func(id int) {
-		println("wasmdock: close", id)
-		client.Call("closeWindow", id)
-	}
-
-	// setWorkspace asks the compositor to switch the active workspace to
-	// `index` (1..workspaceCount). Travels over the SDK's MessagePort just
-	// like `launch`; the compositor's WindowManager.handle_client_message
-	// routes the message to its `:set_workspace` arm and broadcasts a
-	// `workspace_changed` event back here on success (which updates the
-	// model + repaints).
-	setWorkspace := func(index int) {
-		println("wasmdock: setWorkspace", index)
-		client.Call("setWorkspace", index)
-	}
-
-	// Initial paint so the compositor has something to blit immediately.
+	// Initial paint so the compositor has something to blit immediately, plus a
+	// first geometry publish so a probe can read the resting layout.
 	render()
+	exposeGeometry(state)
 
 	cb := js.FuncOf(func(_ js.Value, args []js.Value) any {
 		if len(args) == 0 {
@@ -116,22 +124,33 @@ func main() {
 			x := ev.Get("x").Int()
 			y := ev.Get("y").Int()
 			state.SetCursor(x, y, true)
-			// No hover paint in v0; SetCursor is recorded for a future
-			// highlight pass. Avoid an unconditional re-render on every
-			// mousemove so the worker stays idle while the cursor wanders.
+			// Repaint so the hover magnification follows the cursor. Skipped
+			// when the effect is off so a flat dock stays idle while the cursor
+			// wanders.
+			if state.Magnify.On {
+				render()
+				exposeGeometry(state)
+			}
+		case "mouseleave", "mouseout":
+			// Pointer left the panel — drop the magnification back to flat.
+			state.SetCursor(state.CursorX, state.CursorY, false)
+			if state.Magnify.On {
+				render()
+				exposeGeometry(state)
+			}
 		case "mousedown":
 			x := ev.Get("x").Int()
 			y := ev.Get("y").Int()
-			// Mouse button: 0 = left, 2 = right (matches the W3C DOM
-			// MouseEvent.button). The compositor forwards the raw value via
-			// forward_mouse_to_client; missing field falls back to 0.
+			// Keep the cursor recorded so hit-testing reads the SAME magnified
+			// geometry the user is clicking on.
+			state.SetCursor(x, y, true)
+			// Mouse button: 0 = left, 2 = right (W3C DOM MouseEvent.button).
 			button := 0
 			if b := ev.Get("button"); !b.IsUndefined() && !b.IsNull() {
 				button = b.Int()
 			}
-			// Workspace section: left-click cycles to the next workspace.
-			// A right-click is reserved for a future "workspace menu" — in
-			// v0 it is a no-op (no popup yet, no per-workspace context).
+			// Workspace section: left-click cycles to the next workspace; a
+			// right-click there is reserved for a future workspace menu.
 			if state.HitTestWorkspace(x, y) {
 				if button != 2 {
 					setWorkspace(state.NextWorkspace())
@@ -139,25 +158,23 @@ func main() {
 				break
 			}
 			if i := state.HitTest(x, y); i >= 0 {
-				launch(state.Apps[i].Id)
+				if button == 2 {
+					openMenu(client, state.BuildLauncherMenu(i), x)
+				} else {
+					launch(state.Apps[i].Id)
+				}
 				break
 			}
 			if i := state.HitTestWindow(x, y); i >= 0 {
-				id := state.Windows[i].Id
 				if button == 2 {
-					// Right-click on a window button: close the window.
-					closeWin(id)
+					openMenu(client, state.BuildWindowMenu(i), x)
 				} else {
-					// Left-click (or any non-right button): focus + raise
-					// (restoring first if minimized).
-					focusWin(id)
+					// Left-click focuses + raises (restoring if minimized).
+					focusWin(state.Windows[i].Id)
 				}
 			}
 		case "wheel":
-			// Scroll-wheel input: cycle workspaces when the wheel fires over
-			// the workspace section. deltaY > 0 = scroll DOWN = forward
-			// (next workspace); deltaY < 0 = scroll UP = backward (previous
-			// workspace). A wheel elsewhere on the toolbar is ignored.
+			// Scroll-wheel over the workspace section cycles workspaces.
 			x := ev.Get("x").Int()
 			y := ev.Get("y").Int()
 			if !state.HitTestWorkspace(x, y) {
@@ -173,12 +190,6 @@ func main() {
 				setWorkspace(state.PrevWorkspace())
 			}
 		case "workspace_changed":
-			// Compositor pushes the new active workspace + total count after
-			// a successful set_workspace. Update the model + repaint so the
-			// workspace section shows the new "<active> of <count>" label.
-			// The compositor sends a windows_changed immediately after this
-			// event, so the iconbar refresh is handled by that arm and we
-			// only need to re-render the workspace label here.
 			if c := ev.Get("count"); !c.IsUndefined() && !c.IsNull() {
 				state.SetWorkspaceCount(c.Int())
 			}
@@ -187,12 +198,6 @@ func main() {
 			}
 			render()
 		case "windows_changed":
-			// Compositor pushes the current open-window list as a
-			// JSON-encoded array string under `windows_json`. We parse it
-			// into a fresh []scene.Window and re-render so the iconbar
-			// reflects the new state (new window, close, minimize, restore,
-			// focus shift, title rename — every state-changing event posts
-			// a fresh windows_changed).
 			raw := ev.Get("windows_json")
 			if raw.IsUndefined() || raw.IsNull() {
 				state.SetWindows(nil)
@@ -205,11 +210,8 @@ func main() {
 				state.SetWindows(parsed)
 			}
 			render()
+			exposeGeometry(state) // test hook: publish button rects
 		case "tick":
-			// Clock tick posted by worker.js. The payload field "clock"
-			// carries the latest "HH:MM" string; the optional "workspace"
-			// field can update the workspace label without a separate
-			// event type.
 			clock := ev.Get("clock")
 			if !clock.IsUndefined() && !clock.IsNull() {
 				state.SetClock(clock.String())
@@ -220,14 +222,6 @@ func main() {
 			}
 			render()
 		case "theme_changed":
-			// Compositor broadcasts the new active theme to every panel after
-			// a successful set_theme. The payload carries `name` (display
-			// label, for future "active theme" indicators) and `themerc`
-			// (the raw .themerc source — we re-parse it locally rather than
-			// reading individual fields off JS so a future theme attribute
-			// is one parser change here, not a wire-shape change). Unknown
-			// names + empty .themerc are dropped silently; the dock keeps
-			// its previous theme.
 			rc := ev.Get("themerc")
 			if rc.IsUndefined() || rc.IsNull() {
 				break
@@ -246,4 +240,98 @@ func main() {
 
 	// Park forever so the Go runtime keeps the FuncOf callback alive.
 	select {}
+}
+
+// openMenu opens the dock's right-click application context menu in a child
+// popup surface anchored above the clicked entry, paints it via the pure
+// scene.DockMenu renderer, and routes a click inside it back to a launch /
+// focus / close wire message. The 28px bar is far too short to draw a menu
+// in-surface, so this uses the compositor's existing "popup" role (no
+// compositor change): SetCursor-consistent hit-testing picks the entry, the
+// compositor grab-dismisses the popup on an outside click, and a selection
+// requests the popup's close. A no-op when the menu is empty or the SDK has no
+// openPopup (the .verify harness stub), so the dock never throws.
+func openMenu(client js.Value, menu scene.DockMenu, anchorX int) {
+	if len(menu.Entries) == 0 || !hasMethod(client, "openPopup") {
+		return
+	}
+	// Anchor the menu above the bar (rel_y negative pops it upward), centred
+	// under the click and clamped to the parent's left edge.
+	relX := anchorX - menu.W/2
+	if relX < 0 {
+		relX = 0
+	}
+	opts := js.Global().Call("Object")
+	opts.Set("title", "dock menu")
+	opts.Set("w", menu.W)
+	opts.Set("h", menu.H)
+	opts.Set("rel_x", relX)
+	opts.Set("rel_y", -menu.H)
+	popup := client.Call("openPopup", opts)
+
+	hover := -1
+	var buf []byte
+	var pw, ph int
+	var pixels js.Value
+
+	paint := func() {
+		if buf == nil {
+			return
+		}
+		menu.MenuRender(buf, pw, ph, hover)
+		if hasMethod(popup, "beginFrame") {
+			popup.Call("beginFrame")
+		}
+		js.CopyBytesToJS(pixels, buf)
+		popup.Call("commit", js.Undefined())
+	}
+
+	var inputCb js.Func
+	popup.Call("onWelcome", js.FuncOf(func(_ js.Value, _ []js.Value) any {
+		pw = popup.Get("w").Int()
+		ph = popup.Get("h").Int()
+		pixels = popup.Get("pixels")
+		buf = make([]byte, 4*pw*ph)
+		paint()
+		return nil
+	}))
+	inputCb = js.FuncOf(func(_ js.Value, args []js.Value) any {
+		if len(args) == 0 {
+			return nil
+		}
+		ev := args[0]
+		switch ev.Get("kind").String() {
+		case "mousemove":
+			if hv := menu.MenuHover(ev.Get("y").Int()); hv != hover {
+				hover = hv
+				paint()
+			}
+		case "mousedown":
+			if idx := menu.MenuHitTest(ev.Get("y").Int()); idx >= 0 {
+				dispatchMenu(client, menu.Entries[idx])
+			}
+			// Dismiss the menu after a click (a selection or a gap click).
+			if hasMethod(popup, "requestClose") {
+				popup.Call("requestClose")
+			}
+		}
+		return nil
+	})
+	popup.Call("onInput", inputCb)
+	popup.Call("onClosed", js.FuncOf(func(this js.Value, _ []js.Value) any {
+		inputCb.Release()
+		return nil
+	}))
+}
+
+// dispatchMenu sends the wire message a chosen menu entry maps to.
+func dispatchMenu(client js.Value, e scene.MenuEntry) {
+	switch e.Action {
+	case scene.ActLaunch:
+		client.Call("launch", e.App)
+	case scene.ActFocus:
+		client.Call("focus", e.Win)
+	case scene.ActClose:
+		client.Call("closeWindow", e.Win)
+	}
 }
