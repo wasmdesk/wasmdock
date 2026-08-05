@@ -1,5 +1,13 @@
 # wasmbox-side integration for wasmdock
 
+> **Status: landed.** Both extensions specified below — the `launch` message
+> handler (§1) and the `"panel"` surface role (§2) — are now implemented in
+> `wasmbox` (the `LAUNCHABLE` trust registry in
+> `compositor/04_window_manager.rb` and the `panel` role in
+> `compositor/03_window.rb`). This document is kept as the design record and the
+> contract the dock relies on; the graceful-degradation behaviour still holds on
+> any host that lacks them.
+
 `wasmdock` is an **external client** of the [`wasmbox`](https://github.com/wasmdesk/wasmbox)
 compositor. It speaks the existing step-B protocol (`hello` / `welcome` /
 `commit` / `input` / `set_title` / `request_close` / `closed`) verbatim, so it
