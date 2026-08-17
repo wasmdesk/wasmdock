@@ -36,22 +36,15 @@ func hasMethod(v js.Value, name string) bool {
 	return v.Get(name).Type() == js.TypeFunction
 }
 
-// exposeGeometry publishes the dock's current launcher + window-button
-// rectangles (MAGNIFIED when the cursor hovers, so a probe clicks where the
-// button is actually painted) on a worker global for headless probes. Read via
+// exposeGeometry publishes the dock's current launcher rectangles (MAGNIFIED
+// when the cursor hovers, so a probe clicks where the icon is actually painted)
+// on a worker global for headless probes. Read via
 // worker.evaluate(() => globalThis.__wasmdockGeometry); the screen position of
 // a rect is (VIEW_W - w)/2 + x, (VIEW_H - h) + y (the dock is bottom-center
-// anchored). Cheap; refreshed on window changes + hover repaints.
+// anchored). Open windows collapse into indicators on their launcher, so the
+// probe reads launcher rects only. Cheap; refreshed on window changes + hover
+// repaints.
 func exposeGeometry(state *scene.State) {
-	wr := state.WindowRects()
-	buttons := make([]interface{}, 0, len(wr))
-	for i, r := range wr {
-		w := state.Windows[i]
-		buttons = append(buttons, map[string]interface{}{
-			"id": w.Id, "title": w.Title, "minimized": w.Minimized,
-			"focused": w.Focused, "x": r[0], "y": r[1], "w": r[2], "h": r[3],
-		})
-	}
 	lr := state.LauncherRects()
 	launchers := make([]interface{}, 0, len(lr))
 	for i, r := range lr {
@@ -60,7 +53,7 @@ func exposeGeometry(state *scene.State) {
 		})
 	}
 	js.Global().Set("__wasmdockGeometry", js.ValueOf(map[string]interface{}{
-		"w": state.W, "h": state.H, "buttons": buttons, "launchers": launchers,
+		"w": state.W, "h": state.H, "launchers": launchers,
 	}))
 }
 
@@ -103,7 +96,6 @@ func main() {
 	}
 
 	launch := func(app string) { client.Call("launch", app) }
-	focusWin := func(id int) { client.Call("focus", id) }
 
 	// setWorkspace asks the compositor to switch the active workspace.
 	setWorkspace := func(index int) { client.Call("setWorkspace", index) }
@@ -164,14 +156,6 @@ func main() {
 					launch(state.Apps[i].Id)
 				}
 				break
-			}
-			if i := state.HitTestWindow(x, y); i >= 0 {
-				if button == 2 {
-					openMenu(client, state.BuildWindowMenu(i), x)
-				} else {
-					// Left-click focuses + raises (restoring if minimized).
-					focusWin(state.Windows[i].Id)
-				}
 			}
 		case "wheel":
 			// Scroll-wheel over the workspace section cycles workspaces.

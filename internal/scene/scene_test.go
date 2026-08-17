@@ -26,6 +26,10 @@ func newPainter(w, h int) ([]byte, *painter.PixelPainter) {
 	return buf, painter.NewPixelPainter(buf, w, h)
 }
 
+// glyphInk is the near-black ink the dock passes its icon painters; the glyph
+// tests use it directly now that drawGlyph takes the ink from its host.
+var glyphInk = toolkit.RGB(0x1a, 0x1a, 0x1a)
+
 func TestNewHasDefaults(t *testing.T) {
 	s := New(tW, tH)
 	if got, want := len(s.Apps), 4; got != want {
@@ -76,71 +80,36 @@ func TestIconbarClampsToZeroOnNarrowSurface(t *testing.T) {
 	}
 }
 
-// IconbarButtonRect places the i-th button at WorkspaceW + i*(W+gap).
-func TestIconbarButtonRectStride(t *testing.T) {
+// The iconbar is composed from a toolkit.AppDock: LauncherRects reports one
+// laid-out rect per launcher, and a click at a launcher's centre HitTests to
+// that launcher index, whose Apps[i].Id is the documented launch string. This
+// is the dock's paint == hit-test contract, exercised through a full Render.
+func TestDockLauncherHitTest(t *testing.T) {
+	wantIDs := []string{"terminal", "editor", "files", "hello"}
 	s := New(tW, tH)
-	wantH := tH - 2*IconbarVPad
-	for i := range s.Apps {
-		bx, by, bw, bh := s.IconbarButtonRect(i)
-		wantX := WorkspaceW + i*(IconbarButtonW+IconbarButtonGap)
-		if bx != wantX {
-			t.Fatalf("button[%d].x = %d, want %d", i, bx, wantX)
+	buf := newBuf(s)
+	Render(s, buf) // renders through the AppDock
+	rects := s.LauncherRects()
+	if len(rects) != len(s.Apps) {
+		t.Fatalf("LauncherRects len %d, want %d", len(rects), len(s.Apps))
+	}
+	for i, r := range rects {
+		if r[2] <= 0 || r[3] <= 0 {
+			t.Fatalf("launcher %d has empty rect %v", i, r)
 		}
-		if by != IconbarVPad {
-			t.Fatalf("button[%d].y = %d, want %d", i, by, IconbarVPad)
+		cx := r[0] + r[2]/2
+		cy := r[1] + r[3]/2
+		if got := s.HitTest(cx, cy); got != i {
+			t.Fatalf("HitTest centre of launcher %d = %d, want %d", i, got, i)
 		}
-		if bw != IconbarButtonW || bh != wantH {
-			t.Fatalf("button[%d] size = %dx%d, want %dx%d", i, bw, bh, IconbarButtonW, wantH)
-		}
-	}
-}
-
-// Button height scales to fill the granted surface height (tested for the
-// h=60 case the compositor actually grants because Theme::MIN_H = 60).
-func TestIconbarButtonRectScalesWithSurface(t *testing.T) {
-	s := New(tW, 60)
-	_, by, _, bh := s.IconbarButtonRect(0)
-	if by != IconbarVPad {
-		t.Fatalf("button.y at h=60 = %d, want %d", by, IconbarVPad)
-	}
-	if want := 60 - 2*IconbarVPad; bh != want {
-		t.Fatalf("button.h at h=60 = %d, want %d", bh, want)
-	}
-}
-
-// A degenerate surface (h < 2*IconbarVPad+1) clamps button height to 1
-// instead of returning a non-positive size.
-func TestIconbarButtonRectClampsHeight(t *testing.T) {
-	s := New(tW, 1) // 1 < 2*IconbarVPad => negative would land here
-	_, _, _, bh := s.IconbarButtonRect(0)
-	if bh != 1 {
-		t.Fatalf("button.h on 1-px surface = %d, want 1", bh)
-	}
-}
-
-// A click at the center of button i must HitTest to i, and the resulting
-// Apps[i].Id must be the documented launch string ("terminal"/"editor"/etc).
-func TestClickAtButtonCenterDispatchesExpectedApp(t *testing.T) {
-	cases := []string{"terminal", "editor", "files", "hello"}
-	s := New(tW, tH)
-	if got, want := len(s.Apps), len(cases); got != want {
-		t.Fatalf("apps = %d, want %d", got, want)
-	}
-	for i, wantID := range cases {
-		bx, by, bw, bh := s.IconbarButtonRect(i)
-		px := bx + bw/2
-		py := by + bh/2
-		hit := s.HitTest(px, py)
-		if hit != i {
-			t.Fatalf("HitTest center of button %d = %d, want %d", i, hit, i)
-		}
-		if got := s.Apps[hit].Id; got != wantID {
-			t.Fatalf("button %d dispatches %q, want %q", i, got, wantID)
+		if got := s.Apps[i].Id; got != wantIDs[i] {
+			t.Fatalf("launcher %d dispatches %q, want %q", i, got, wantIDs[i])
 		}
 	}
 }
 
-// Clicks on the workspace label / clock are inert (HitTest returns -1).
+// Clicks on the workspace label / clock fall outside the dock bounds so
+// HitTest returns -1.
 func TestClicksOnWorkspaceAndClockAreInert(t *testing.T) {
 	s := New(tW, tH)
 	if got := s.HitTest(WorkspaceW/2, tH/2); got != -1 {
@@ -148,28 +117,6 @@ func TestClicksOnWorkspaceAndClockAreInert(t *testing.T) {
 	}
 	if got := s.HitTest(tW-ClockW/2, tH/2); got != -1 {
 		t.Fatalf("clock click HitTest = %d, want -1", got)
-	}
-}
-
-// A click above or below the button row inside the iconbar misses.
-func TestClickOutsideButtonRow(t *testing.T) {
-	s := New(tW, tH)
-	if got := s.HitTest(WorkspaceW+10, 0); got != -1 {
-		t.Fatalf("y=0 click HitTest = %d, want -1 (above button row)", got)
-	}
-	if got := s.HitTest(WorkspaceW+10, tH-1); got != -1 {
-		t.Fatalf("y=H-1 click HitTest = %d, want -1 (below button row)", got)
-	}
-}
-
-// A click inside the iconbar but in the inter-button gap misses.
-func TestClickInGapMisses(t *testing.T) {
-	s := New(tW, tH)
-	// Place the click between button 0 and button 1.
-	bx0, _, bw0, _ := s.IconbarButtonRect(0)
-	gapX := bx0 + bw0 // first column of the gap (gap is IconbarButtonGap=2 wide)
-	if got := s.HitTest(gapX, IconbarVPad+IconbarButtonH/2); got != -1 {
-		t.Fatalf("gap-click HitTest = %d, want -1", got)
 	}
 }
 
@@ -316,7 +263,7 @@ func TestEachGlyphPaints(t *testing.T) {
 		for i := 0; i+3 < len(buf); i += 4 {
 			buf[i], buf[i+1], buf[i+2], buf[i+3] = 0xC8, 0xC8, 0xC8, 0xFF
 		}
-		drawGlyph(p, g, toolkit.Rect{X: 10, Y: 10, W: IconGlyphPx, H: IconGlyphPx})
+		drawGlyph(p, g, toolkit.Rect{X: 10, Y: 10, W: IconGlyphPx, H: IconGlyphPx}, glyphInk)
 		painted := 0
 		for y := 10; y < 10+IconGlyphPx; y++ {
 			for x := 10; x < 10+IconGlyphPx; x++ {
@@ -335,7 +282,7 @@ func TestEachGlyphPaints(t *testing.T) {
 // drawGlyphHello with a wider-than-tall box exercises the h/2 < r clamp.
 func TestDrawGlyphHelloWideBox(t *testing.T) {
 	buf, p := newPainter(tW, tH)
-	drawGlyph(p, GlyphHello, toolkit.Rect{X: 0, Y: 0, W: 20, H: 8})
+	drawGlyph(p, GlyphHello, toolkit.Rect{X: 0, Y: 0, W: 20, H: 8}, glyphInk)
 	painted := 0
 	for i := range buf {
 		if buf[i] != 0 {
@@ -350,8 +297,8 @@ func TestDrawGlyphHelloWideBox(t *testing.T) {
 // drawGlyph with a non-positive size is a no-op.
 func TestDrawGlyphDegenerate(t *testing.T) {
 	buf, p := newPainter(40, BarHeight)
-	drawGlyph(p, GlyphTerminal, toolkit.Rect{X: 0, Y: 0, W: 0, H: 10})
-	drawGlyph(p, GlyphTerminal, toolkit.Rect{X: 0, Y: 0, W: 10, H: 0})
+	drawGlyph(p, GlyphTerminal, toolkit.Rect{X: 0, Y: 0, W: 0, H: 10}, glyphInk)
+	drawGlyph(p, GlyphTerminal, toolkit.Rect{X: 0, Y: 0, W: 10, H: 0}, glyphInk)
 	for _, b := range buf {
 		if b != 0 {
 			t.Fatalf("degenerate drawGlyph painted something: %d", b)
@@ -378,83 +325,6 @@ func TestDrawBevel(t *testing.T) {
 	off = ((2+8-1)*40 + (2 + 8 - 1)) * 4
 	if !(buf[off] == 0x40 && buf[off+1] == 0x40 && buf[off+2] == 0x40) {
 		t.Fatalf("bevel bottom-right not dark: %v", buf[off:off+3])
-	}
-}
-
-// drawSunkenBevel is the inverse of drawBevel (dark top-left, bright
-// bottom-right) and a no-op on a degenerate rect.
-func TestDrawSunkenBevel(t *testing.T) {
-	buf, p := newPainter(40, BarHeight)
-	drawSunkenBevel(p, toolkit.Rect{X: 0, Y: 0, W: 0, H: 10})
-	drawSunkenBevel(p, toolkit.Rect{X: 0, Y: 0, W: 10, H: 0})
-	for _, b := range buf {
-		if b != 0 {
-			t.Fatalf("degenerate drawSunkenBevel painted something: %d", b)
-		}
-	}
-	drawSunkenBevel(p, toolkit.Rect{X: 2, Y: 2, W: 8, H: 8})
-	off := (2*40 + 2) * 4
-	if !(buf[off] == 0x40 && buf[off+1] == 0x40 && buf[off+2] == 0x40) {
-		t.Fatalf("sunken bevel top-left not dark: %v", buf[off:off+3])
-	}
-	off = ((2+8-1)*40 + (2 + 8 - 1)) * 4
-	if !(buf[off] == 0xFF && buf[off+1] == 0xFF && buf[off+2] == 0xFF) {
-		t.Fatalf("sunken bevel bottom-right not bright: %v", buf[off:off+3])
-	}
-}
-
-// drawClippedText with a non-positive maxWidth is a no-op; a maxWidth smaller
-// than one glyph paints nothing; an unknown char is silently skipped.
-func TestDrawClippedTextEdgeCases(t *testing.T) {
-	red := toolkit.RGB(0xFF, 0, 0)
-	buf, p := newPainter(60, BarHeight)
-	drawClippedText(p, "abc", 0, 0, red, 0)
-	for _, b := range buf {
-		if b != 0 {
-			t.Fatalf("clipped paint at maxWidth=0 painted something")
-		}
-	}
-	buf, p = newPainter(60, BarHeight)
-	drawClippedText(p, "abc", 0, 0, red, charWidth-1)
-	for _, b := range buf {
-		if b != 0 {
-			t.Fatalf("sub-glyph maxWidth painted something")
-		}
-	}
-	buf, p = newPainter(60, BarHeight)
-	drawClippedText(p, "@1", 0, 0, red, 1<<20)
-	painted := 0
-	for i := 0; i+3 < len(buf); i += 4 {
-		if buf[i] == 0xFF && buf[i+1] == 0 && buf[i+2] == 0 {
-			painted++
-		}
-	}
-	if painted == 0 {
-		t.Fatalf("known char never painted alongside unknown")
-	}
-}
-
-// drawClippedText stops once the next glyph would push past maxWidth.
-func TestDrawClippedTextTruncates(t *testing.T) {
-	red := toolkit.RGB(0xFF, 0, 0)
-	buf, p := newPainter(60, BarHeight)
-	drawClippedText(p, "111", 0, 0, red, 1<<20) // full
-	full := 0
-	for i := 0; i+3 < len(buf); i += 4 {
-		if buf[i] == 0xFF {
-			full++
-		}
-	}
-	buf, p = newPainter(60, BarHeight)
-	drawClippedText(p, "111", 0, 0, red, 12) // 12/6 = 2 glyphs
-	clipped := 0
-	for i := 0; i+3 < len(buf); i += 4 {
-		if buf[i] == 0xFF {
-			clipped++
-		}
-	}
-	if clipped == 0 || clipped >= full {
-		t.Fatalf("clip did not truncate: full=%d clipped=%d", full, clipped)
 	}
 }
 
@@ -525,8 +395,9 @@ func TestPaintBg(t *testing.T) {
 
 // ---- narrow-surface + overflow render paths -------------------------------
 
-// drawIconbarButton clips its right edge when its w would exceed the
-// section. Exercised by rendering on a narrow surface.
+// The dock clips its items to the iconbar rect on a narrow surface. Exercised
+// by rendering on a narrow surface (must not panic and must paint the top-left
+// border).
 func TestRenderNarrowIconbarClipsButtons(t *testing.T) {
 	s := New(220, BarHeight)
 	buf := newBuf(s)
@@ -536,8 +407,8 @@ func TestRenderNarrowIconbarClipsButtons(t *testing.T) {
 	}
 }
 
-// The iconbar stops painting once a launcher button's anchor falls past the
-// iconbar's right edge. Reproduced by stuffing in extra apps.
+// The dock stops painting once a launcher's anchor falls past the iconbar's
+// right edge. Reproduced by stuffing in extra apps on a narrow surface.
 func TestRenderStopsExtraIconbarButtons(t *testing.T) {
 	s := New(400, BarHeight)
 	s.Apps = []App{
@@ -546,10 +417,10 @@ func TestRenderStopsExtraIconbarButtons(t *testing.T) {
 		{Id: "c", Glyph: GlyphFiles, Label: "C"},
 	}
 	buf := newBuf(s)
-	Render(s, buf) // must not panic and the loop must `break`
+	Render(s, buf) // must not panic
 }
 
-// When the iconbar shrinks to width 0 the inner button loop must not paint.
+// When the iconbar shrinks to width 0 the dock must not paint any item.
 func TestRenderZeroWidthIconbar(t *testing.T) {
 	s := New(WorkspaceW+ClockW, BarHeight) // iconbar collapses to 0
 	buf := newBuf(s)
@@ -581,222 +452,27 @@ func TestSetWindowsStores(t *testing.T) {
 	}
 }
 
-// WindowButtonRect places the i-th window button past the launcher row + the
-// SeparatorW gap.
-func TestWindowButtonRectFollowsLaunchersPastSeparator(t *testing.T) {
+// An open window whose title maps to a launcher lights that launcher's running
+// indicator (drawn by the dock) — the grouped-window model: no per-window
+// button, the window collapses onto its launcher. Rendering with a focused,
+// badged running window must not panic and the launcher must stay hit-testable.
+func TestRenderRunningLauncherIndicator(t *testing.T) {
 	s := New(tW, tH)
-	s.SetWindows([]Window{{Id: 1, Title: "a"}, {Id: 2, Title: "b"}})
-	ix, _, _, _ := s.IconbarRect()
-	wantBaseX := ix + len(s.Apps)*(IconbarButtonW+IconbarButtonGap) - IconbarButtonGap + SeparatorW
-	for i := range s.Windows {
-		wx, wy, ww, wh := s.WindowButtonRect(i)
-		expX := wantBaseX + i*(IconbarButtonW+IconbarButtonGap)
-		if wx != expX {
-			t.Fatalf("window[%d].x = %d, want %d (past SeparatorW gap)", i, wx, expX)
-		}
-		if wy != IconbarVPad {
-			t.Fatalf("window[%d].y = %d, want %d", i, wy, IconbarVPad)
-		}
-		if ww != IconbarButtonW || wh != tH-2*IconbarVPad {
-			t.Fatalf("window[%d] size = %dx%d, want %dx%d", i, ww, wh, IconbarButtonW, tH-2*IconbarVPad)
-		}
-	}
-}
-
-// WindowButtonRect with zero launchers anchors at the iconbar's left edge
-// (the empty-Apps fallback).
-func TestWindowButtonRectWithNoLaunchers(t *testing.T) {
-	s := New(tW, tH)
-	s.Apps = nil
-	s.SetWindows([]Window{{Id: 1, Title: "solo"}})
-	wx, _, _, _ := s.WindowButtonRect(0)
-	ix, _, _, _ := s.IconbarRect()
-	if wx != ix {
-		t.Fatalf("zero-launcher window[0].x = %d, want %d (iconbar left)", wx, ix)
-	}
-}
-
-// WindowButtonRect with degenerate surface clamps height to 1.
-func TestWindowButtonRectClampsHeight(t *testing.T) {
-	s := New(tW, 1)
-	s.SetWindows([]Window{{Id: 1, Title: "a"}})
-	_, _, _, wh := s.WindowButtonRect(0)
-	if wh != 1 {
-		t.Fatalf("window button.h on 1-px surface = %d, want 1", wh)
-	}
-}
-
-// HitTestWindow returns the window index for clicks inside a window button
-// and -1 for clicks outside (workspace, clock, launcher row, above/below row).
-func TestHitTestWindow(t *testing.T) {
-	s := New(tW, tH)
-	s.SetWindows([]Window{{Id: 10, Title: "win10"}, {Id: 20, Title: "win20", Focused: true}})
-	for i := range s.Windows {
-		bx, by, bw, bh := s.WindowButtonRect(i)
-		px := bx + bw/2
-		py := by + bh/2
-		if got := s.HitTestWindow(px, py); got != i {
-			t.Fatalf("HitTestWindow center of window %d = %d, want %d", i, got, i)
-		}
-		if got := s.HitTest(px, py); got != -1 {
-			t.Fatalf("HitTest center of window %d = %d, want -1 (launcher hit-test)", i, got)
-		}
-	}
-	if got := s.HitTestWindow(WorkspaceW/2, tH/2); got != -1 {
-		t.Fatalf("workspace HitTestWindow = %d, want -1", got)
-	}
-	if got := s.HitTestWindow(tW-ClockW/2, tH/2); got != -1 {
-		t.Fatalf("clock HitTestWindow = %d, want -1", got)
-	}
-	bx, by, bw, bh := s.IconbarButtonRect(0)
-	if got := s.HitTestWindow(bx+bw/2, by+bh/2); got != -1 {
-		t.Fatalf("launcher click HitTestWindow = %d, want -1", got)
-	}
-}
-
-// HitTestWindow returns -1 when a window's anchor falls past the iconbar's
-// right edge (very narrow surface fallback). Covers both the outer "click
-// outside iconbar" early return and the inner per-window "this window's
-// anchor is past the iconbar" early return.
-func TestHitTestWindowOverflow(t *testing.T) {
-	// 400-px surface: iconbar width = 400 - 100 - 80 = 220 -> fits 1 button +
-	// part of a second. Default 4 launchers + a window -> the window's anchor
-	// is past the iconbar's right edge.
-	s := New(400, BarHeight)
-	s.SetWindows([]Window{{Id: 99, Title: "off-screen"}})
-	bx, _, _, _ := s.WindowButtonRect(0)
-	ix, _, iw, _ := s.IconbarRect()
-	if bx < ix+iw {
-		t.Fatalf("test setup wrong: expected window button anchor past iconbar end (bx=%d, ix+iw=%d)", bx, ix+iw)
-	}
-	if got := s.HitTestWindow(bx+1, IconbarVPad+1); got != -1 {
-		t.Fatalf("HitTestWindow past iconbar end = %d, want -1", got)
-	}
-	if got := s.HitTestWindow(ix+iw-1, IconbarVPad+1); got != -1 {
-		t.Fatalf("HitTestWindow inside iconbar but window-anchor past = %d, want -1", got)
-	}
-}
-
-// A window button paints ink for its title in the slot just past the
-// launcher row + the SeparatorW gap.
-func TestRenderWindowInked(t *testing.T) {
-	s := New(tW, tH)
-	s.SetWindows([]Window{{Id: 7, Title: "alpha"}})
+	s.SetWindows([]Window{{Id: 7, Title: "Terminal", Focused: true}})
+	s.SetBadge("terminal", 3)
 	buf := newBuf(s)
-	Render(s, buf)
-	bx, by, bw, bh := s.WindowButtonRect(0)
-	found := false
-	for y := by; y < by+bh && !found; y++ {
-		for x := bx; x < bx+bw && !found; x++ {
-			off := (y*tW + x) * 4
-			if buf[off] < 0x40 && buf[off+1] < 0x40 && buf[off+2] < 0x40 {
-				found = true
-			}
-		}
+	Render(s, buf) // covers running + active + badge on the launcher
+	// The terminal launcher (index 0) is running + focused-active.
+	if run := s.launcherRunning(); !run[0] {
+		t.Fatalf("terminal launcher should be running")
 	}
-	if !found {
-		t.Fatalf("window button never inked any pixels")
+	if s.focusedLauncher() != 0 {
+		t.Fatalf("focused launcher = %d, want 0", s.focusedLauncher())
 	}
-}
-
-// Render does not panic when a window's anchor falls past the iconbar's right
-// edge (matches the launcher break-on-overflow path).
-func TestRenderWindowOverflow(t *testing.T) {
-	s := New(400, BarHeight) // narrow iconbar; default apps + windows won't all fit
-	s.SetWindows([]Window{{Id: 1, Title: "off"}, {Id: 2, Title: "off2"}})
-	buf := newBuf(s)
-	Render(s, buf) // must not panic, must break out of the window loop
-}
-
-// Render clips the right edge of a window button whose right side extends
-// past the iconbar's right edge (the `bx+cw > ix+iw` branch). Reproduced by
-// dropping the launcher row so a window button anchored at the iconbar's
-// left can extend to the right while the iconbar is too narrow to fit it.
-func TestRenderWindowClipsRightEdge(t *testing.T) {
-	// Narrow iconbar (iconbar width = 230 - 100 - 80 = 50) + no launchers so a
-	// single window button anchors INSIDE the iconbar (bx < ix+iw) but its
-	// right edge sticks out (bx + IconbarButtonW=120 > ix+iw=50).
-	s := New(230, BarHeight)
-	s.Apps = nil
-	s.SetWindows([]Window{{Id: 1, Title: "clipme"}})
-	bx, _, _, _ := s.WindowButtonRect(0)
-	ix, _, iw, _ := s.IconbarRect()
-	if !(bx < ix+iw && bx+IconbarButtonW > ix+iw) {
-		t.Fatalf("test setup wrong: need bx<ix+iw<bx+W (bx=%d, ix+iw=%d, W=%d)", bx, ix+iw, IconbarButtonW)
+	r := s.LauncherRects()[0]
+	if got := s.HitTest(r[0]+r[2]/2, r[1]+r[3]/2); got != 0 {
+		t.Fatalf("HitTest of running launcher = %d, want 0", got)
 	}
-	buf := newBuf(s)
-	Render(s, buf) // must not panic, must clip the button
-}
-
-// A focused window button must paint with a sunken bevel: the top stroke is
-// the SUNKEN highlight (dark) while an unfocused button carries the RAISED
-// highlight (bright).
-func TestRenderFocusedSunkenBevel(t *testing.T) {
-	s := New(tW, tH)
-	s.SetWindows([]Window{
-		{Id: 1, Title: "f", Focused: true},
-		{Id: 2, Title: "u"},
-	})
-	buf := newBuf(s)
-	Render(s, buf)
-	bx0, by0, bw0, _ := s.WindowButtonRect(0) // focused
-	bx1, by1, bw1, _ := s.WindowButtonRect(1) // unfocused
-	off0 := (by0*tW + bx0 + bw0/2) * 4
-	off1 := (by1*tW + bx1 + bw1/2) * 4
-	if !(buf[off0] < 0x80 && buf[off0+1] < 0x80 && buf[off0+2] < 0x80) {
-		t.Fatalf("focused window top-stroke not dark: rgb=(%d,%d,%d)", buf[off0], buf[off0+1], buf[off0+2])
-	}
-	if !(buf[off1] > 0xC0 && buf[off1+1] > 0xC0 && buf[off1+2] > 0xC0) {
-		t.Fatalf("unfocused window top-stroke not bright: rgb=(%d,%d,%d)", buf[off1], buf[off1+1], buf[off1+2])
-	}
-}
-
-// A minimized window button must paint the "[*] " accent prefix + a raised
-// bevel (it is not focused).
-func TestRenderMinimizedStylesDim(t *testing.T) {
-	s := New(tW, tH)
-	s.SetWindows([]Window{{Id: 1, Title: "alpha", Minimized: true}})
-	buf := newBuf(s)
-	Render(s, buf)
-	bx, by, bw, bh := s.WindowButtonRect(0)
-	found := false
-	for y := by; y < by+bh && !found; y++ {
-		for x := bx; x < bx+bw && !found; x++ {
-			off := (y*tW + x) * 4
-			if buf[off] < 0x40 {
-				found = true
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("minimized window button never inked any pixels")
-	}
-	off := (by*tW + bx + bw/2) * 4
-	if !(buf[off] > 0xC0 && buf[off+1] > 0xC0 && buf[off+2] > 0xC0) {
-		t.Fatalf("minimized window top-stroke not bright: rgb=(%d,%d,%d)", buf[off], buf[off+1], buf[off+2])
-	}
-}
-
-// The separator line is painted in the SeparatorW gap when launchers exist.
-func TestRenderSeparatorPainted(t *testing.T) {
-	s := New(tW, tH)
-	buf := newBuf(s)
-	Render(s, buf)
-	ix, _, _, _ := s.IconbarRect()
-	sepRight := ix + len(s.Apps)*(IconbarButtonW+IconbarButtonGap) - IconbarButtonGap + SeparatorW
-	sepX := sepRight - SeparatorW/2 - 1
-	off := ((tH/2)*tW + sepX) * 4
-	if !(buf[off] < 0x60 && buf[off+1] < 0x60 && buf[off+2] < 0x60) {
-		t.Fatalf("separator not painted dark at sepX=%d: rgb=(%d,%d,%d)", sepX, buf[off], buf[off+1], buf[off+2])
-	}
-}
-
-// The separator is skipped when the Apps slice is empty.
-func TestRenderSeparatorSkippedWhenEmptyApps(t *testing.T) {
-	s := New(tW, tH)
-	s.Apps = nil
-	buf := newBuf(s)
-	Render(s, buf) // must not panic
 }
 
 // ---- workspaces -----------------------------------------------------------
