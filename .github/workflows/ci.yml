@@ -1,0 +1,59 @@
+# Headless CI for wasmdock — the pure-Go WASM dock for wasmdesk.
+#
+# One job:
+#   build-and-test — gofmt + go vet, build the native packages, build the
+#                    dock.wasm target (GOOS=js GOARCH=wasm), and run the pure
+#                    scene/theme unit tests.
+#
+# CGO is off everywhere (the whole stack is pure Go); GOWORK=off keeps the
+# module self-contained. Builds/tests run with -mod=readonly so a drifted
+# go.sum fails the lane instead of being silently rewritten.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GOWORK: "off"
+  CGO_ENABLED: "0"
+  GOFLAGS: "-mod=readonly"
+
+jobs:
+  build-and-test:
+    name: Build + native tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+          check-latest: true
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build native packages
+        run: go build ./...
+
+      - name: Build the dock wasm (GOOS=js GOARCH=wasm)
+        run: GOOS=js GOARCH=wasm go build -o dock.wasm .
+
+      - name: Native scene + theme tests
+        run: go test -count=1 ./...
