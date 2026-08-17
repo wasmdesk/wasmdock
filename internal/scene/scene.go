@@ -16,13 +16,13 @@
 //     one button per OPEN WINDOW the compositor handed us via the
 //     `windows_changed` input event. Window buttons render in three styles
 //     that match Fluxbox semantics:
-//       - focused window: sunken bevel + active-title background +
-//         active-label ink — reads as the currently selected button;
-//       - unfocused open window: raised bevel + inactive-title background
-//         + active-label ink — reads as a normal button;
-//       - minimized window: raised bevel + inactive-title background +
-//         inactive-label ink + "[*] " accent prefix — reads as a folded
-//         entry;
+//   - focused window: sunken bevel + active-title background +
+//     active-label ink — reads as the currently selected button;
+//   - unfocused open window: raised bevel + inactive-title background
+//   - active-label ink — reads as a normal button;
+//   - minimized window: raised bevel + inactive-title background +
+//     inactive-label ink + "[*] " accent prefix — reads as a folded
+//     entry;
 //     Left-clicking a window button posts a `focus` message to the
 //     compositor (which raises + focuses it, restoring it first if it was
 //     minimized); right-clicking posts a `close` message;

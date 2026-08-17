@@ -42,8 +42,8 @@ func (s *State) SetMagnify(m Magnify) { s.Magnify = m }
 // magnification is inactive the rectangle equals the resting geometry and scale
 // is 1.
 type slot struct {
-	isWindow bool
-	idx      int
+	isWindow   bool
+	idx        int
 	x, y, w, h int
 	scale      float64
 }

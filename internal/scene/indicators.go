@@ -174,6 +174,6 @@ func drawBadge(p painter.Painter, r toolkit.Rect, count int) {
 var badgeTheme = func() *toolkit.Theme {
 	th := toolkit.DefaultLight()
 	th.Accent = toolkit.RGB(0xE0, 0x1B, 0x24)     // alert red pill
-	th.Background = toolkit.RGB(0xFF, 0xFF, 0xFF)  // white ink
+	th.Background = toolkit.RGB(0xFF, 0xFF, 0xFF) // white ink
 	return th
 }()
