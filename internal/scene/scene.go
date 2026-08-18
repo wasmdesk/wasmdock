@@ -34,9 +34,9 @@
 // left. Each launcher hands the dock an icon painter; the app glyphs that are
 // bespoke Fluxbox marks (terminal / hello) stay custom Draw while the two that
 // map cleanly onto stock artwork reuse the toolkit icon library (editor →
-// DrawIconNew, files → DrawIconOpen). The workspace / clock ends keep their
-// custom Fluxbox bevel / gradient chrome (paintBg / drawBevel), which has no
-// stock equivalent.
+// DrawIconNew, files → DrawIconOpen). The workspace / clock ends compose their
+// Fluxbox bevel / gradient chrome from a toolkit.Backdrop (gradient fill +
+// raised bevel), so no hand-drawn shape-painting is left in the toolbar.
 //
 // The State value remains the single source of truth for layout: the pure
 // *Rect / HitTest* geometry methods are unchanged, so the wasm main's
@@ -460,14 +460,42 @@ type section struct {
 	ink  theme.Color
 }
 
-// Draw paints the section's gradient face, bevel and centred label.
+// Draw paints the section as a composed toolkit.Backdrop — a gradient (or flat)
+// face under a raised Fluxbox bevel — then overlays the centred label. The
+// Backdrop owns the last hand-drawn Fluxbox chrome the toolbar ends used to
+// paint by hand (the per-pixel gradient + the 1-pixel raised bevel), so there
+// is no bespoke shape-drawing left here; only the toolkit text stack.
 func (w *section) Draw(p painter.Painter, _ *toolkit.Theme) {
 	r := w.Bounds()
-	paintBg(p, r, w.bg)
-	drawBevel(p, r)
+	bd := toolkit.Backdrop{
+		Fill:  rgba(w.bg.Color),
+		Bevel: toolkit.BevelRaised,
+	}
+	if w.bg.Gradient != theme.GradientFlat {
+		bd.GradientTo = rgba(w.bg.ColorTo)
+		bd.GradientDir = gradientDir(w.bg.Gradient)
+	}
+	bd.SetBounds(r)
+	bd.Draw(p, dockToolkitTheme)
 	tx := r.X + (r.W-toolkit.TextWidth(w.text))/2
 	ty := r.Y + (r.H-toolkit.GlyphHeight())/2
 	toolkit.DrawText(p, tx, ty, w.text, rgba(w.ink))
+}
+
+// gradientDir maps a theme.GradientType onto the toolkit.Backdrop gradient
+// direction. Flat / unknown fall back to GradientVertical, though a Flat bg
+// never reaches here (section.Draw gates the gradient on != GradientFlat).
+func gradientDir(g theme.GradientType) toolkit.GradientDir {
+	switch g {
+	case theme.GradientHorizontal:
+		return toolkit.GradientHorizontal
+	case theme.GradientDiagonal:
+		return toolkit.GradientDiagonal
+	case theme.GradientCrossDiagonal:
+		return toolkit.GradientCrossDiagonal
+	default:
+		return toolkit.GradientVertical
+	}
 }
 
 // iconbar is the flex middle section: it paints the active-title background +
@@ -522,86 +550,6 @@ func (s *State) buildDock() *toolkit.AppDock {
 	ix, _, iw, _ := s.IconbarRect()
 	d.SetBounds(toolkit.Rect{X: ix, Y: 0, W: iw, H: s.H})
 	return d
-}
-
-// ---- painter primitives (Fluxbox chrome) ---------------------------------
-
-// paintBg fills r with a theme.Bg gradient. A flat fill is one FillRect;
-// vertical / horizontal / diagonal / cross-diagonal interpolate per pixel via
-// the same lerp the theme package uses so the pixels match byte-for-byte.
-func paintBg(p painter.Painter, r toolkit.Rect, bg theme.Bg) {
-	if r.W <= 0 || r.H <= 0 {
-		return
-	}
-	if bg.Gradient == theme.GradientFlat {
-		p.FillRect(r, rgba(bg.Color))
-		return
-	}
-	for j := 0; j < r.H; j++ {
-		for i := 0; i < r.W; i++ {
-			p.PutPixel(r.X+i, r.Y+j, rgba(gradientAt(bg.Gradient, i, j, r.W, r.H, bg.Color, bg.ColorTo)))
-		}
-	}
-}
-
-// gradientAt resolves the colour at (i, j) inside an rw x rh section under the
-// given gradient — a per-channel linear lerp between c1 and c2. Mirrors the
-// theme package's interp so a widget-drawn gradient is pixel-identical to the
-// raw-buffer PaintGradient it replaces. Unhandled (flat / bevel / recorded-
-// only) variants return solid c1.
-func gradientAt(g theme.GradientType, i, j, rw, rh int, c1, c2 theme.Color) theme.Color {
-	switch g {
-	case theme.GradientVertical:
-		return lerpColor(c1, c2, j, rh-1)
-	case theme.GradientHorizontal:
-		return lerpColor(c1, c2, i, rw-1)
-	case theme.GradientDiagonal:
-		return lerpColor(c1, c2, i+j, (rw-1)+(rh-1))
-	case theme.GradientCrossDiagonal:
-		return lerpColor(c1, c2, (rw-1-i)+j, (rw-1)+(rh-1))
-	default:
-		return c1
-	}
-}
-
-// lerpColor interpolates each RGB channel linearly between c1 (at step=0) and
-// c2 (at step=denom). A non-positive denom collapses to c1 (1-pixel section).
-func lerpColor(c1, c2 theme.Color, step, denom int) theme.Color {
-	if denom <= 0 {
-		return c1
-	}
-	if step < 0 {
-		step = 0
-	}
-	if step > denom {
-		step = denom
-	}
-	var out theme.Color
-	for k := 0; k < 3; k++ {
-		a := int(c1[k])
-		b := int(c2[k])
-		out[k] = uint8(a + (b-a)*step/denom)
-	}
-	return out
-}
-
-// drawBevel paints a 1-pixel raised bevel around r: a bright top + left, a
-// dark bottom + right. The highlights are pure white / near-black so they read
-// clearly against any gradient face.
-func drawBevel(p painter.Painter, r toolkit.Rect) {
-	if r.W <= 0 || r.H <= 0 {
-		return
-	}
-	hi := toolkit.RGB(0xFF, 0xFF, 0xFF)
-	lo := toolkit.RGB(0x40, 0x40, 0x40)
-	for i := 0; i < r.W; i++ {
-		p.PutPixel(r.X+i, r.Y, hi)
-		p.PutPixel(r.X+i, r.Y+r.H-1, lo)
-	}
-	for j := 0; j < r.H; j++ {
-		p.PutPixel(r.X, r.Y+j, hi)
-		p.PutPixel(r.X+r.W-1, r.Y+j, lo)
-	}
 }
 
 // ---- glyph drawing -------------------------------------------------------
