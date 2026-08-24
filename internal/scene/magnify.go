@@ -5,9 +5,9 @@ package scene
 // Magnify configures the macOS-style dock magnification: as the cursor hovers
 // over the iconbar the launcher under the pointer (and its neighbours, with a
 // smooth falloff) swell, and the row re-lays so the swollen icons never
-// overlap. The effect itself now lives in the composed toolkit.AppDock (see
-// scene.buildDock); this struct is the dock's public knobs, forwarded onto the
-// widget every frame.
+// overlap. The effect itself lives in the persistent toolkit.AppDock (see
+// scene.ensureView / syncView); this struct is the dock's public knobs,
+// forwarded onto the widget every frame.
 //
 //   - On       toggles the effect. When false the dock lays out flat (every
 //     scale is 1), which is also the layout when the cursor is off-surface.
@@ -39,7 +39,8 @@ func (s *State) SetMagnify(m Magnify) { s.Magnify = m }
 // paint, hit-testing and this probe hook all share one layout. Exposed so the
 // wasm shell can publish the live geometry for headless probes.
 func (s *State) LauncherRects() [][4]int {
-	rs := s.buildDock().ItemRects()
+	s.syncView()
+	rs := s.view.dock.ItemRects()
 	out := make([][4]int, len(rs))
 	for i, r := range rs {
 		out[i] = [4]int{r.X, r.Y, r.W, r.H}

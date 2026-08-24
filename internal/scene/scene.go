@@ -28,21 +28,24 @@
 // fixed-width ends (the workspace label + the clock) and a flex iconbar in
 // the middle, exactly mirroring the three-section geometry. The workspace /
 // clock ends are `section` leaf widgets; the iconbar is a thin container that
-// composes a toolkit.AppDock (see buildDock) — the widget owns all the dock
-// chrome (rounded item faces, running dots, active fill, attention badges) and
-// the hover magnification, so there are no hand-drawn Fluxbox button bevels
-// left. Each launcher hands the dock an icon painter; the app glyphs that are
-// bespoke Fluxbox marks (terminal / hello) stay custom Draw while the two that
-// map cleanly onto stock artwork reuse the toolkit icon library (editor →
-// DrawIconNew, files → DrawIconOpen). The workspace / clock ends compose their
-// Fluxbox bevel / gradient chrome from a toolkit.Backdrop (gradient fill +
-// raised bevel), so no hand-drawn shape-painting is left in the toolbar.
+// draws a toolkit.AppDock — the widget owns all the dock chrome (rounded item
+// faces, running dots, active fill, attention badges) and the hover
+// magnification, so there are no hand-drawn Fluxbox button bevels left. Each
+// launcher hands the dock an icon painter that draws its mark from the iconoir
+// icon family (terminal / page-edit / folder / emoji) — no hand-drawn pixel art.
+// The workspace / clock ends compose their Fluxbox bevel / gradient chrome from a
+// toolkit.Backdrop (gradient fill + raised bevel) and the top-border strip is a
+// 1-pixel toolkit.Backdrop, so no hand-drawn shape-painting is left in the
+// toolbar.
 //
-// The State value remains the single source of truth for layout: the pure
-// *Rect / HitTest* geometry methods are unchanged, so the wasm main's
-// button/wheel-aware event dispatch keeps working byte-for-byte. Render
-// rebuilds the (cheap) widget view from the current State each frame, so a
-// direct field mutation is always reflected.
+// The widget tree is built ONCE (ensureView) and cached on the State; every
+// frame syncView binds the live model onto it — the workspace / clock labels
+// through shared mvvm.Observables and the dock's indicators / cursor through the
+// AppDock's own setters — rather than reallocating widgets, so a hover repaint
+// or a windows_changed event constructs no tree. The State value remains the
+// single source of truth for layout: the pure *Rect / HitTest* geometry methods
+// are unchanged, so the wasm main's button/wheel-aware event dispatch keeps
+// working byte-for-byte.
 //
 // scene is pure Go (no syscall/js, no cgo) so it builds for any architecture
 // and is unit-tested natively. The wasm main only hands it a byte slice to
@@ -51,6 +54,8 @@
 package scene
 
 import (
+	"github.com/go-iconoir/iconoir"
+	"github.com/go-widgets/mvvm"
 	"github.com/go-widgets/painter"
 	"github.com/go-widgets/toolkit"
 	"github.com/wasmdesk/wasmdock/internal/theme"
@@ -68,7 +73,7 @@ type App struct {
 
 // Window identifies one open (or folded) compositor window. In the grouped-
 // window dock model a window is not surfaced as its own button — it collapses
-// into indicators on its launcher (see indicators.go / buildDock). Id is the
+// into indicators on its launcher (see indicators.go / syncView). Id is the
 // compositor's window id (echoed back in `focus` / `close` / `restore`
 // messages, and used by the right-click window menu); Title is the window
 // title (also used to map a window to its launcher when the compositor does
@@ -103,13 +108,13 @@ type Window struct {
 type Glyph int
 
 const (
-	// GlyphTerminal draws a command prompt: ">" caret + underscore cursor.
+	// GlyphTerminal draws the iconoir "terminal" mark (a command prompt).
 	GlyphTerminal Glyph = iota
-	// GlyphEditor draws a document with a folded corner (toolkit stock New icon).
+	// GlyphEditor draws the iconoir "page-edit" mark (a document being edited).
 	GlyphEditor
-	// GlyphFiles draws a folder shape (toolkit stock Open icon).
+	// GlyphFiles draws the iconoir "folder" mark.
 	GlyphFiles
-	// GlyphHello draws a smile arc — the hello stub client's mark.
+	// GlyphHello draws the iconoir "emoji" mark (a smiley) — the hello client's mark.
 	GlyphHello
 )
 
@@ -178,6 +183,28 @@ type State struct {
 	// badges holds the per-launcher attention-badge counts, keyed by app id
 	// (see indicators.go). nil until the first SetBadge; read via BadgeCount.
 	badges map[string]int
+
+	// view is the PERSISTENT toolkit widget tree (built once by ensureView,
+	// cached here). Every frame syncView mutates its reactive state in place —
+	// the workspace / clock labels through shared mvvm.Observables, the dock's
+	// running / active / badge indicators and cursor through the AppDock's own
+	// setters — instead of reallocating the tree, so a hover repaint or a
+	// windows_changed event constructs no widgets (the HARD "no per-frame
+	// rebuild" rule). nil until the first Render / HitTest / LauncherRects.
+	view *dockView
+}
+
+// dockView is the dock's persistent widget tree: the HBox shell with the
+// workspace label + clock ends and the AppDock iconbar in the middle, plus the
+// 1-pixel top-border strip. Built once (ensureView); reactive state is bound
+// through the section labels' mvvm.Observables and mutated in place by syncView.
+type dockView struct {
+	root   *toolkit.HBox
+	ws     *section
+	clock  *section
+	dock   *toolkit.AppDock
+	border *toolkit.Backdrop
+	nApps  int // launcher count the dock's items were built for
 }
 
 // DefaultApps is the built-in launcher set the iconbar ships with.
@@ -374,8 +401,8 @@ func (s *State) HitTestWorkspace(x, y int) bool {
 // actions are reached through the right-click menu rather than a separate
 // hit-test.
 func (s *State) HitTest(x, y int) int {
-	d := s.buildDock()
-	return d.HitTest(x, y)
+	s.syncView()
+	return s.view.dock.HitTest(x, y)
 }
 
 // ---- painting: the toolkit widget tree -----------------------------------
@@ -395,76 +422,140 @@ func rgba(c theme.Color) toolkit.RGBA { return toolkit.RGB(c[0], c[1], c[2]) }
 // (a size mismatch in the caller is a bug). The whole surface is opaque —
 // the toolbar paints every pixel from edge to edge.
 //
-// Render builds the widget view from the current State, lays it out with one
-// container pass and paints it, then overlays the 1-pixel top border chrome.
+// Render syncs the PERSISTENT widget view to the current State (no tree
+// rebuild), lays it out with one container pass and paints it, then overlays the
+// 1-pixel top-border strip.
 func Render(s *State, buf []byte) {
 	need := 4 * s.W * s.H
 	if len(buf) != need {
 		panic("scene: buffer size mismatch")
 	}
 	p := painter.NewPixelPainter(buf, s.W, s.H)
-	root := buildRoot(s)
-	root.SetBounds(toolkit.Rect{X: 0, Y: 0, W: s.W, H: s.H})
-	root.Draw(p, dockToolkitTheme)
+	s.syncView()
+	s.view.root.Draw(p, dockToolkitTheme)
 
-	// Outer border on the very top edge of the toolbar (the bottom edge sits
-	// at the bottom of the canvas, so a bottom border is not visible). One
-	// pixel of theme.Border.Color spanning the full surface width.
+	// Outer border on the very top edge of the toolbar (the bottom edge sits at
+	// the bottom of the canvas, so a bottom border is not visible): a 1-pixel-tall
+	// Backdrop filled with theme.Border.Color spanning the full surface width — a
+	// toolkit widget in place of a per-pixel PutPixel loop.
 	if s.Theme.Border.Width > 0 {
-		bc := rgba(s.Theme.Border.Color)
-		for x := 0; x < s.W; x++ {
-			p.PutPixel(x, 0, bc)
-		}
+		s.view.border.SetBounds(toolkit.Rect{X: 0, Y: 0, W: s.W, H: 1})
+		s.view.border.Draw(p, dockToolkitTheme)
 	}
 }
 
-// buildRoot assembles the dock's widget tree for the current State: an HBox
-// shell with a fixed workspace label on the left, a flex iconbar in the
-// middle, and a fixed clock on the right. It is cheap enough to rebuild every
-// frame, which keeps State the single source of truth (a direct field
-// mutation is reflected on the next Render without a separate sync step).
-func buildRoot(s *State) *toolkit.HBox {
-	root := toolkit.NewHBox()
-	root.Spacing = 0
-
-	ws := &section{
-		bg:   s.Theme.Window.Inactive.Title.Bg,
-		text: s.Workspace,
-		ink:  s.Theme.Window.Inactive.Title.Label.Color,
+// ensureView builds the persistent widget tree the first time it is needed and
+// caches it on the State: an HBox shell (fixed workspace label, flex AppDock
+// iconbar, fixed clock) plus the top-border strip. The shell + the section
+// leaves are built ONCE; the dock's AppDockItems are (re)built only when the
+// launcher count changes (never in production — s.Apps is fixed after New), so
+// no frame reallocates the tree. Each launcher's Icon painter closes over its
+// stable Glyph; the reactive per-launcher flags are mutated in place by
+// syncView.
+func (s *State) ensureView() {
+	if s.view == nil {
+		v := &dockView{
+			ws:     newSection(),
+			clock:  newSection(),
+			dock:   toolkit.NewAppDock(),
+			border: &toolkit.Backdrop{},
+			nApps:  -1,
+		}
+		root := toolkit.NewHBox()
+		root.Spacing = 0
+		root.AddFixed(v.ws, WorkspaceW)
+		root.AddFlex(&iconbar{s: s}, 1)
+		root.AddFixed(v.clock, ClockW)
+		v.root = root
+		s.view = v
 	}
-	root.AddFixed(ws, WorkspaceW)
+	if s.view.nApps != len(s.Apps) {
+		items := make([]toolkit.AppDockItem, len(s.Apps))
+		for i, app := range s.Apps {
+			g := app.Glyph
+			items[i] = toolkit.AppDockItem{
+				Id:    app.Id,
+				Label: app.Label,
+				Icon: func(p painter.Painter, r toolkit.Rect, ink toolkit.RGBA) {
+					drawGlyph(p, g, r, ink)
+				},
+			}
+		}
+		s.view.dock.Items = items
+		s.view.nApps = len(s.Apps)
+	}
+}
 
-	ib := &iconbar{s: s}
-	root.AddFlex(ib, 1)
+// syncView binds the live State onto the persistent widget tree without
+// rebuilding it: the workspace / clock labels flow through the section leaves'
+// shared mvvm.Observables, the section chrome + border colour track the active
+// theme, and the AppDock's per-launcher running / active / badge indicators,
+// magnification knobs and cursor are set through the widget's own fields /
+// setters. It then lays the shell out across the full surface (one container
+// pass) so a subsequent Draw / HitTest / ItemRects reads the current geometry.
+func (s *State) syncView() {
+	s.ensureView()
+	v := s.view
+
+	// Workspace + clock labels: reactive text through the shared Observable;
+	// chrome from the active Openbox theme.
+	v.ws.text.Set(s.Workspace)
+	v.ws.bg = s.Theme.Window.Inactive.Title.Bg
+	v.ws.ink = s.Theme.Window.Inactive.Title.Label.Color
 
 	clock := s.Clock
 	if clock == "" {
 		clock = "--:--"
 	}
-	ck := &section{
-		bg:   s.Theme.Osd.Bg,
-		text: clock,
-		ink:  s.Theme.Osd.Label.Color,
+	v.clock.text.Set(clock)
+	v.clock.bg = s.Theme.Osd.Bg
+	v.clock.ink = s.Theme.Osd.Label.Color
+
+	// Dock indicators: mutate the persistent items in place (grouped-window
+	// model — Running lights the "app open" dot, Active fills the focused
+	// launcher, Badge overlays the attention count).
+	running := s.launcherRunning()
+	focus := s.focusedLauncher()
+	for i := range v.dock.Items {
+		v.dock.Items[i].Running = running[i]
+		v.dock.Items[i].Active = i == focus
+		v.dock.Items[i].Badge = s.BadgeCount(s.Apps[i].Id)
 	}
-	root.AddFixed(ck, ClockW)
-	return root
+	v.dock.Magnify = s.Magnify.On
+	v.dock.MaxScale = s.Magnify.MaxScale
+	v.dock.Radius = s.Magnify.Radius
+	v.dock.SetCursor(s.CursorX, s.CursorInside)
+	ix, _, iw, _ := s.IconbarRect()
+	v.dock.SetBounds(toolkit.Rect{X: ix, Y: 0, W: iw, H: s.H})
+
+	v.border.Fill = rgba(s.Theme.Border.Color)
+
+	v.root.SetBounds(toolkit.Rect{X: 0, Y: 0, W: s.W, H: s.H})
 }
 
 // section is a fixed-width bevelled toolbar end (the workspace label + the
-// clock): a gradient background, a raised bevel, and one line of centred
-// text. Both ends share this leaf; only their bg / text / ink differ.
+// clock): a gradient background, a raised bevel, and one line of centred text.
+// Both ends share this leaf; only their bg / ink and their reactive text differ.
+// text is a shared mvvm.Observable so the label the compositor pushes (a
+// workspace switch, a clock tick) flows to the leaf without the host copying the
+// string into a field every frame — Draw reads the live value.
 type section struct {
 	toolkit.Base
 	bg   theme.Bg
-	text string
+	text *mvvm.Observable[string]
 	ink  theme.Color
 }
 
+// newSection makes a section leaf with an empty text Observable ready to bind.
+func newSection() *section {
+	return &section{text: mvvm.NewObservable("")}
+}
+
 // Draw paints the section as a composed toolkit.Backdrop — a gradient (or flat)
-// face under a raised Fluxbox bevel — then overlays the centred label. The
-// Backdrop owns the last hand-drawn Fluxbox chrome the toolbar ends used to
-// paint by hand (the per-pixel gradient + the 1-pixel raised bevel), so there
-// is no bespoke shape-drawing left here; only the toolkit text stack.
+// face under a raised Fluxbox bevel — then overlays the centred label read from
+// the reactive text Observable. The Backdrop owns the Fluxbox chrome (gradient +
+// raised bevel), so there is no bespoke shape-drawing here; only the toolkit
+// text stack.
 func (w *section) Draw(p painter.Painter, _ *toolkit.Theme) {
 	r := w.Bounds()
 	bd := toolkit.Backdrop{
@@ -477,9 +568,10 @@ func (w *section) Draw(p painter.Painter, _ *toolkit.Theme) {
 	}
 	bd.SetBounds(r)
 	bd.Draw(p, dockToolkitTheme)
-	tx := r.X + (r.W-toolkit.TextWidth(w.text))/2
+	txt := w.text.Get()
+	tx := r.X + (r.W-toolkit.TextWidth(txt))/2
 	ty := r.Y + (r.H-toolkit.GlyphHeight())/2
-	toolkit.DrawText(p, tx, ty, w.text, rgba(w.ink))
+	toolkit.DrawText(p, tx, ty, txt, rgba(w.ink))
 }
 
 // gradientDir maps a theme.GradientType onto the toolkit.Backdrop gradient
@@ -507,112 +599,47 @@ type iconbar struct {
 	s *State
 }
 
-// Draw composes the iconbar from a toolkit.AppDock (the modern grouped-window
-// dock) and paints it. buildDock maps each launcher to a dock icon item and
-// folds the running / active / badge state onto it, so the widget owns all the
-// chrome (rounded faces, running dots, active fill, attention badges) and the
-// hover magnification — no hand-drawn Fluxbox bevels here.
+// Draw paints the persistent toolkit.AppDock (the modern grouped-window dock).
+// The dock's items, running / active / badge indicators, magnification and
+// cursor are kept current by syncView (which every entry point runs before a
+// Draw), so the widget owns all the chrome (rounded faces, running dots, active
+// fill, attention badges) and the hover magnification — no per-frame rebuild and
+// no hand-drawn Fluxbox bevels here.
 func (ib *iconbar) Draw(p painter.Painter, th *toolkit.Theme) {
-	d := ib.s.buildDock()
-	d.Draw(p, th)
-}
-
-// buildDock assembles the toolkit.AppDock for the current State: one
-// AppDockItem per LAUNCHER (s.Apps). Open windows do NOT get their own button —
-// they collapse into indicators on their launcher: item.Running lights the "app
-// is open" dot, item.Active fills the launcher whose window holds focus, and
-// item.Badge overlays the attention count. The dock is bounded to the iconbar
-// rect and handed the live cursor so its magnification + hit-testing read the
-// same layout the user sees. Cheap enough to rebuild every frame, keeping State
-// the single source of truth.
-func (s *State) buildDock() *toolkit.AppDock {
-	running := s.launcherRunning()
-	focus := s.focusedLauncher()
-	items := make([]toolkit.AppDockItem, len(s.Apps))
-	for i, app := range s.Apps {
-		g := app.Glyph
-		items[i] = toolkit.AppDockItem{
-			Id:    app.Id,
-			Label: app.Label,
-			Icon: func(p painter.Painter, r toolkit.Rect, ink toolkit.RGBA) {
-				drawGlyph(p, g, r, ink)
-			},
-			Running: running[i],
-			Active:  i == focus,
-			Badge:   s.BadgeCount(app.Id),
-		}
-	}
-	d := toolkit.NewAppDock(items...)
-	d.Magnify = s.Magnify.On
-	d.MaxScale = s.Magnify.MaxScale
-	d.Radius = s.Magnify.Radius
-	d.SetCursor(s.CursorX, s.CursorInside)
-	ix, _, iw, _ := s.IconbarRect()
-	d.SetBounds(toolkit.Rect{X: ix, Y: 0, W: iw, H: s.H})
-	return d
+	ib.s.view.dock.Draw(p, th)
 }
 
 // ---- glyph drawing -------------------------------------------------------
 
-// drawGlyph paints one of the built-in icon marks into r. The two glyphs that
-// map cleanly onto the toolkit's stock icon library reuse it (editor →
-// DrawIconNew, files → DrawIconOpen); the bespoke Fluxbox marks (terminal /
-// hello) stay custom Draw.
+// glyphStem maps a Glyph onto its iconoir stem (verified against
+// iconoir.Names()): the launcher marks are drawn from the iconoir icon family —
+// no hand-drawn pixel art — so the dock reads the same icon set as the rest of
+// the toolkit UI. An unknown glyph maps to "" (no stem) and falls back to a
+// solid square in drawGlyph.
+func glyphStem(g Glyph) string {
+	switch g {
+	case GlyphTerminal:
+		return "terminal"
+	case GlyphEditor:
+		return "page-edit"
+	case GlyphFiles:
+		return "folder"
+	case GlyphHello:
+		return "emoji"
+	default:
+		return ""
+	}
+}
+
+// drawGlyph paints one launcher's icon mark into r via iconoir.Draw. A
+// non-positive rect is a no-op; an unknown glyph (no stem, or a stem iconoir
+// does not carry) paints a solid square so the slot stays visible.
 func drawGlyph(p painter.Painter, g Glyph, r toolkit.Rect, ink toolkit.RGBA) {
 	if r.W <= 0 || r.H <= 0 {
 		return
 	}
-	switch g {
-	case GlyphTerminal:
-		drawGlyphTerminal(p, r, ink)
-	case GlyphEditor:
-		toolkit.DrawIconNew(p, r, ink)
-	case GlyphFiles:
-		toolkit.DrawIconOpen(p, r, ink)
-	case GlyphHello:
-		drawGlyphHello(p, r, ink)
-	default:
-		// Unknown glyph: paint a solid square so the slot is still visible.
-		p.FillRect(r, ink)
+	if stem := glyphStem(g); stem != "" && iconoir.Draw(p, r, stem, ink) {
+		return
 	}
-}
-
-func drawGlyphTerminal(p painter.Painter, r toolkit.Rect, ink toolkit.RGBA) {
-	x, y, w, h := r.X, r.Y, r.W, r.H
-	// ">" caret + underscore cursor inside the box.
-	cx := x + w*2/5
-	cy := y + h/2
-	arm := h / 4
-	for t := 0; t <= arm; t++ {
-		p.PutPixel(cx-arm+t, cy-arm+t, ink)
-		p.PutPixel(cx-arm+t, cy+arm-t, ink)
-	}
-	uy := y + h*3/4
-	for ux := x + 2; ux < x+w-2; ux++ {
-		p.PutPixel(ux, uy, ink)
-	}
-}
-
-func drawGlyphHello(p painter.Painter, r toolkit.Rect, ink toolkit.RGBA) {
-	x, y, w, h := r.X, r.Y, r.W, r.H
-	// Smile arc: bottom half of a "circle" inside the box.
-	cx := x + w/2
-	cy := y + h/2
-	rad := w / 2
-	if h/2 < rad {
-		rad = h / 2
-	}
-	for i := -rad; i <= rad; i++ {
-		p.PutPixel(cx+i, cy+(rad-abs(i))/2, ink)
-	}
-	// Two eyes.
-	p.PutPixel(cx-rad/2, cy-rad/2, ink)
-	p.PutPixel(cx+rad/2, cy-rad/2, ink)
-}
-
-func abs(i int) int {
-	if i < 0 {
-		return -i
-	}
-	return i
+	p.FillRect(r, ink)
 }

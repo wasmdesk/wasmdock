@@ -108,6 +108,59 @@ func TestDockLauncherHitTest(t *testing.T) {
 	}
 }
 
+// The widget tree is PERSISTENT: Render / HitTest / LauncherRects across many
+// frames (including cursor moves and a windows_changed) reuse the SAME dockView
+// and AppDock rather than rebuilding, and the reactive indicators are mutated in
+// place on that one dock. This is the "no per-frame rebuild" contract.
+func TestPersistentViewReusedAcrossFrames(t *testing.T) {
+	s := New(tW, tH)
+	buf := newBuf(s)
+	Render(s, buf)
+	view0 := s.view
+	dock0 := s.view.dock
+	if view0 == nil || dock0 == nil {
+		t.Fatalf("view not built after first Render")
+	}
+	// A hover repaint, a hit-test, a geometry probe and a windows change must all
+	// reuse the same widgets.
+	s.SetCursor(200, tH/2, true)
+	Render(s, buf)
+	s.HitTest(200, tH/2)
+	s.LauncherRects()
+	s.SetWindows([]Window{{Id: 1, Title: "Terminal", Focused: true}})
+	s.SetBadge("terminal", 2)
+	Render(s, buf)
+	if s.view != view0 {
+		t.Fatalf("dockView was rebuilt across frames (persistent-tree violation)")
+	}
+	if s.view.dock != dock0 {
+		t.Fatalf("AppDock was rebuilt across frames (persistent-tree violation)")
+	}
+	// The running/active/badge indicators were folded onto the SAME dock in place.
+	it := s.view.dock.Items[0] // terminal
+	if !it.Running || !it.Active || it.Badge != 2 {
+		t.Fatalf("terminal item indicators not synced in place: %+v", it)
+	}
+}
+
+// A change in the launcher count (never in production, but a public field) is the
+// one event that re-materialises the dock's items; the shell + section leaves
+// stay the same persistent widgets.
+func TestAppCountChangeRebuildsItemsOnly(t *testing.T) {
+	s := New(tW, tH)
+	buf := newBuf(s)
+	Render(s, buf)
+	view0, ws0 := s.view, s.view.ws
+	s.Apps = []App{{Id: "only", Glyph: GlyphTerminal, Label: "Only"}}
+	Render(s, buf)
+	if s.view != view0 || s.view.ws != ws0 {
+		t.Fatalf("shell/section leaves were rebuilt on an app-count change")
+	}
+	if len(s.view.dock.Items) != 1 || s.view.dock.Items[0].Id != "only" {
+		t.Fatalf("dock items not rematerialised for the new app set: %+v", s.view.dock.Items)
+	}
+}
+
 // Clicks on the workspace label / clock fall outside the dock bounds so
 // HitTest returns -1.
 func TestClicksOnWorkspaceAndClockAreInert(t *testing.T) {
@@ -279,8 +332,9 @@ func TestEachGlyphPaints(t *testing.T) {
 	}
 }
 
-// drawGlyphHello with a wider-than-tall box exercises the h/2 < r clamp.
-func TestDrawGlyphHelloWideBox(t *testing.T) {
+// drawGlyph with a wider-than-tall box still paints its iconoir mark (the icon
+// renders into the centred min(W,H) square).
+func TestDrawGlyphWideBox(t *testing.T) {
 	buf, p := newPainter(tW, tH)
 	drawGlyph(p, GlyphHello, toolkit.Rect{X: 0, Y: 0, W: 20, H: 8}, glyphInk)
 	painted := 0
@@ -290,7 +344,23 @@ func TestDrawGlyphHelloWideBox(t *testing.T) {
 		}
 	}
 	if painted == 0 {
-		t.Fatalf("hello glyph in wide box painted nothing")
+		t.Fatalf("glyph in wide box painted nothing")
+	}
+}
+
+// An unknown glyph (no iconoir stem) falls back to a solid filled square.
+func TestDrawGlyphUnknownFallsBackToSquare(t *testing.T) {
+	buf, p := newPainter(tW, tH)
+	r := toolkit.Rect{X: 4, Y: 4, W: IconGlyphPx, H: IconGlyphPx}
+	drawGlyph(p, Glyph(99), r, glyphInk)
+	// Every pixel inside the rect must be the (opaque) ink — a solid fill.
+	for y := r.Y; y < r.Y+r.H; y++ {
+		for x := r.X; x < r.X+r.W; x++ {
+			off := (y*tW + x) * 4
+			if buf[off] != glyphInk.R || buf[off+1] != glyphInk.G || buf[off+2] != glyphInk.B {
+				t.Fatalf("unknown glyph not solid-filled at (%d,%d): %v", x, y, buf[off:off+3])
+			}
+		}
 	}
 }
 
@@ -335,15 +405,14 @@ func TestGradientDir(t *testing.T) {
 func TestSectionDrawBevelAndGradient(t *testing.T) {
 	const w, h = 100, BarHeight
 	buf, p := newPainter(w, h)
-	sec := &section{
-		bg: theme.Bg{
-			Gradient: theme.GradientVertical,
-			Color:    theme.Color{0x30, 0x30, 0x30},
-			ColorTo:  theme.Color{0xC0, 0xC0, 0xC0},
-		},
-		text: "1 of 4",
-		ink:  theme.Color{0, 0, 0},
+	sec := newSection()
+	sec.bg = theme.Bg{
+		Gradient: theme.GradientVertical,
+		Color:    theme.Color{0x30, 0x30, 0x30},
+		ColorTo:  theme.Color{0xC0, 0xC0, 0xC0},
 	}
+	sec.text.Set("1 of 4")
+	sec.ink = theme.Color{0, 0, 0}
 	sec.SetBounds(toolkit.Rect{X: 0, Y: 0, W: w, H: h})
 	sec.Draw(p, dockToolkitTheme)
 
@@ -582,19 +651,6 @@ func TestItoa(t *testing.T) {
 		if got := itoa(c.in); got != c.want {
 			t.Fatalf("itoa(%d) = %q, want %q", c.in, got, c.want)
 		}
-	}
-}
-
-// abs covers the negative-input branch.
-func TestAbs(t *testing.T) {
-	if abs(-3) != 3 {
-		t.Fatal("abs(-3) wrong")
-	}
-	if abs(7) != 7 {
-		t.Fatal("abs(7) wrong")
-	}
-	if abs(0) != 0 {
-		t.Fatal("abs(0) wrong")
 	}
 }
 
