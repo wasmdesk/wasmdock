@@ -52,21 +52,34 @@ func TestNewHasDefaults(t *testing.T) {
 	}
 }
 
-// SectionLayout — the workspace label ends at x=WorkspaceW, the clock begins
-// at x=W-ClockW, and the iconbar fills the middle.
+// SectionLayout — the DockPanel puts the AppDock at the leading edge (x=0)
+// filling the span before the trailing accessories; the workspace pager and the
+// clock sit at the trailing end, the clock rightmost. The three regions read
+// left-to-right dock < pager < clock and none overlaps.
 func TestSectionLayout(t *testing.T) {
 	s := New(tW, tH)
-	wx, _, ww, wh := s.WorkspaceRect()
-	if wx != 0 || ww != WorkspaceW || wh != tH {
-		t.Fatalf("workspace rect = (%d,_,%d,%d), want (0,_,%d,%d)", wx, ww, wh, WorkspaceW, tH)
+	ix, _, iw, _ := s.IconbarRect()
+	if ix != 0 || iw <= 0 {
+		t.Fatalf("iconbar rect = (%d,_,%d,_), want x=0, w>0", ix, iw)
+	}
+	wx, _, ww, _ := s.WorkspaceRect()
+	if ww != pagerWidth(s.WorkspaceCount) {
+		t.Fatalf("pager width = %d, want %d", ww, pagerWidth(s.WorkspaceCount))
 	}
 	cx, _, cw, _ := s.ClockRect()
-	if cx != tW-ClockW || cw != ClockW {
-		t.Fatalf("clock rect = (%d,_,%d,_), want (%d,_,%d,_)", cx, cw, tW-ClockW, ClockW)
+	if cw != ClockW {
+		t.Fatalf("clock width = %d, want %d", cw, ClockW)
 	}
-	ix, _, iw, _ := s.IconbarRect()
-	if ix != WorkspaceW || iw != tW-WorkspaceW-ClockW {
-		t.Fatalf("iconbar rect = (%d,_,%d,_), want (%d,_,%d,_)", ix, iw, WorkspaceW, tW-WorkspaceW-ClockW)
+	// Clock hugs the right edge (within the panel's end padding).
+	if cx+cw > tW || cx+cw < tW-16 {
+		t.Fatalf("clock right edge = %d, want ~%d", cx+cw, tW)
+	}
+	// Order + no overlap: dock right <= pager left, pager right <= clock left.
+	if ix+iw > wx {
+		t.Fatalf("dock (right=%d) overlaps pager (left=%d)", ix+iw, wx)
+	}
+	if wx+ww > cx {
+		t.Fatalf("pager (right=%d) overlaps clock (left=%d)", wx+ww, cx)
 	}
 }
 
@@ -150,25 +163,27 @@ func TestAppCountChangeRebuildsItemsOnly(t *testing.T) {
 	s := New(tW, tH)
 	buf := newBuf(s)
 	Render(s, buf)
-	view0, ws0 := s.view, s.view.ws
+	view0, panel0, pager0 := s.view, s.view.panel, s.view.pager
 	s.Apps = []App{{Id: "only", Glyph: GlyphTerminal, Label: "Only"}}
 	Render(s, buf)
-	if s.view != view0 || s.view.ws != ws0 {
-		t.Fatalf("shell/section leaves were rebuilt on an app-count change")
+	if s.view != view0 || s.view.panel != panel0 || s.view.pager != pager0 {
+		t.Fatalf("shell/accessory widgets were rebuilt on an app-count change")
 	}
 	if len(s.view.dock.Items) != 1 || s.view.dock.Items[0].Id != "only" {
 		t.Fatalf("dock items not rematerialised for the new app set: %+v", s.view.dock.Items)
 	}
 }
 
-// Clicks on the workspace label / clock fall outside the dock bounds so
+// Clicks on the workspace pager / clock fall outside the dock bounds so
 // HitTest returns -1.
 func TestClicksOnWorkspaceAndClockAreInert(t *testing.T) {
 	s := New(tW, tH)
-	if got := s.HitTest(WorkspaceW/2, tH/2); got != -1 {
+	wx, wy, ww, wh := s.WorkspaceRect()
+	if got := s.HitTest(wx+ww/2, wy+wh/2); got != -1 {
 		t.Fatalf("workspace click HitTest = %d, want -1", got)
 	}
-	if got := s.HitTest(tW-ClockW/2, tH/2); got != -1 {
+	cx, cy, cw, ch := s.ClockRect()
+	if got := s.HitTest(cx+cw/2, cy+ch/2); got != -1 {
 		t.Fatalf("clock click HitTest = %d, want -1", got)
 	}
 }
@@ -197,15 +212,16 @@ func TestRenderPanicsOnSizeMismatch(t *testing.T) {
 	Render(s, make([]byte, 4))
 }
 
-// The workspace section should show ink different from its background at
-// the painted-glyph rows.
+// The workspace pager should show ink (cell numbers) different from its
+// background inside its laid-out rectangle.
 func TestRenderWorkspaceLabelInked(t *testing.T) {
 	s := New(tW, tH)
 	buf := newBuf(s)
 	Render(s, buf)
+	wx, _, ww, _ := s.WorkspaceRect()
 	found := false
 	for y := 0; y < tH && !found; y++ {
-		for x := 0; x < WorkspaceW && !found; x++ {
+		for x := wx; x < wx+ww && !found; x++ {
 			off := (y*tW + x) * 4
 			if buf[off] < 0x40 && buf[off+1] < 0x40 && buf[off+2] < 0x40 {
 				found = true
@@ -213,7 +229,7 @@ func TestRenderWorkspaceLabelInked(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("workspace label glyph never inked")
+		t.Fatalf("workspace pager cell number never inked")
 	}
 }
 
@@ -397,27 +413,24 @@ func TestGradientDir(t *testing.T) {
 	}
 }
 
-// A section composes a toolkit.Backdrop, so its face is NOT a flat fill: the
+// The toolbar face is a composed toolkit.Backdrop, so its fill is NOT flat: the
 // raised bevel makes the top row read brighter than the bottom row and the
 // vertical gradient makes the top differ from the bottom in the interior. This
-// asserts the gradient + bevel actually painted (i.e. the Backdrop composed the
-// chrome the old paintBg / drawBevel used to hand-draw).
-func TestSectionDrawBevelAndGradient(t *testing.T) {
-	const w, h = 100, BarHeight
+// asserts barBackdrop composes the gradient + bevel chrome the old per-section
+// paintBg / drawBevel used to hand-draw.
+func TestBarBackdropBevelAndGradient(t *testing.T) {
+	const w, h = 200, BarHeight
 	buf, p := newPainter(w, h)
-	sec := newSection()
-	sec.bg = theme.Bg{
+	th := theme.Theme{}
+	th.Window.Inactive.Title.Bg = theme.Bg{
 		Gradient: theme.GradientVertical,
 		Color:    theme.Color{0x30, 0x30, 0x30},
 		ColorTo:  theme.Color{0xC0, 0xC0, 0xC0},
 	}
-	sec.text.Set("1 of 4")
-	sec.ink = theme.Color{0, 0, 0}
-	sec.SetBounds(toolkit.Rect{X: 0, Y: 0, W: w, H: h})
-	sec.Draw(p, dockToolkitTheme)
+	bd := &toolkit.Backdrop{}
+	barBackdrop(bd, th, toolkit.Rect{X: 0, Y: 0, W: w, H: h})
+	bd.Draw(p, dockToolkitTheme)
 
-	// Sample an interior column away from the centred text so the glyph ink
-	// does not pollute the gradient reading.
 	col := 5
 	lum := func(x, y int) int {
 		off := (y*w + x) * 4
@@ -428,12 +441,28 @@ func TestSectionDrawBevelAndGradient(t *testing.T) {
 		t.Fatalf("raised bevel not painted: top-row lum %d <= bottom-row lum %d",
 			lum(col, 0), lum(col, h-1))
 	}
-	// The interior gradient must vary top -> bottom (Color -> ColorTo), so a
-	// row just under the top bevel must be darker than one just above the
-	// bottom bevel.
+	// The interior gradient must vary top -> bottom (Color -> ColorTo).
 	if lum(col, 2) >= lum(col, h-3) {
 		t.Fatalf("vertical gradient did not vary: upper lum %d >= lower lum %d",
 			lum(col, 2), lum(col, h-3))
+	}
+}
+
+// barBackdrop with a Flat gradient bg paints a flat (non-gradient) fill: the
+// GradientTo stays zero and the direction defaults, exercising the else path.
+func TestBarBackdropFlat(t *testing.T) {
+	th := theme.Theme{}
+	th.Window.Inactive.Title.Bg = theme.Bg{
+		Gradient: theme.GradientFlat,
+		Color:    theme.Color{0x80, 0x80, 0x80},
+	}
+	bd := &toolkit.Backdrop{GradientTo: toolkit.RGB(1, 2, 3), GradientDir: toolkit.GradientHorizontal}
+	barBackdrop(bd, th, toolkit.Rect{X: 0, Y: 0, W: 10, H: BarHeight})
+	if bd.GradientTo != (toolkit.RGBA{}) {
+		t.Fatalf("flat bg should clear GradientTo, got %+v", bd.GradientTo)
+	}
+	if bd.Fill != rgba(theme.Color{0x80, 0x80, 0x80}) {
+		t.Fatalf("flat bg fill = %+v", bd.Fill)
 	}
 }
 
@@ -464,11 +493,15 @@ func TestRenderStopsExtraIconbarButtons(t *testing.T) {
 	Render(s, buf) // must not panic
 }
 
-// When the iconbar shrinks to width 0 the dock must not paint any item.
+// When the accessories fill the whole bar the dock span collapses to width 0
+// and the dock must not paint any item.
 func TestRenderZeroWidthIconbar(t *testing.T) {
-	s := New(WorkspaceW+ClockW, BarHeight) // iconbar collapses to 0
+	s := New(pagerWidth(4)+ClockW, BarHeight) // no room left for the dock
 	buf := newBuf(s)
 	Render(s, buf) // must not panic
+	if _, _, iw, _ := s.IconbarRect(); iw != 0 {
+		t.Fatalf("iconbar width = %d, want 0 when accessories fill the bar", iw)
+	}
 }
 
 // SetWindows stores the snapshot verbatim so the next render picks it up.
@@ -609,16 +642,19 @@ func TestCycleWorkspaceNoCountIsNoop(t *testing.T) {
 	}
 }
 
-// HitTestWorkspace identifies clicks on the left section.
+// HitTestWorkspace identifies clicks inside the workspace pager and rejects
+// clicks over the dock, the clock and off-surface.
 func TestHitTestWorkspace(t *testing.T) {
 	s := New(tW, tH)
-	if !s.HitTestWorkspace(WorkspaceW/2, tH/2) {
-		t.Fatalf("center of workspace section not detected")
+	wx, wy, ww, wh := s.WorkspaceRect()
+	if !s.HitTestWorkspace(wx+ww/2, wy+wh/2) {
+		t.Fatalf("center of workspace pager not detected")
 	}
-	if s.HitTestWorkspace(WorkspaceW+10, tH/2) {
-		t.Fatalf("iconbar click reported as workspace hit")
+	if s.HitTestWorkspace(10, tH/2) {
+		t.Fatalf("iconbar (dock) click reported as workspace hit")
 	}
-	if s.HitTestWorkspace(tW-1, tH/2) {
+	cx, cy, cw, ch := s.ClockRect()
+	if s.HitTestWorkspace(cx+cw/2, cy+ch/2) {
 		t.Fatalf("clock click reported as workspace hit")
 	}
 	if s.HitTestWorkspace(-5, tH/2) {
@@ -685,6 +721,94 @@ func TestRGBA(t *testing.T) {
 	got := rgba(theme.Color{0x12, 0x34, 0x56})
 	if got.R != 0x12 || got.G != 0x34 || got.B != 0x56 || got.A != 0xFF {
 		t.Fatalf("rgba = %+v, want {0x12,0x34,0x56,0xFF}", got)
+	}
+}
+
+// ---- workspace pager interaction -----------------------------------------
+
+// pagerWidth is zero for a non-positive count and the cell+gap sum otherwise.
+func TestPagerWidth(t *testing.T) {
+	if got := pagerWidth(0); got != 0 {
+		t.Fatalf("pagerWidth(0) = %d, want 0", got)
+	}
+	if got := pagerWidth(-3); got != 0 {
+		t.Fatalf("pagerWidth(-3) = %d, want 0", got)
+	}
+	want := 4*toolkit.WorkspacePagerCellW + 3*toolkit.WorkspacePagerGap
+	if got := pagerWidth(4); got != want {
+		t.Fatalf("pagerWidth(4) = %d, want %d", got, want)
+	}
+}
+
+// currentCell maps the active workspace to a 0-based cell, clamped both ways
+// when the count is known and left unclamped-above when the count is unknown.
+func TestCurrentCell(t *testing.T) {
+	s := New(tW, tH) // active 1 / count 4
+	if got := s.currentCell(); got != 0 {
+		t.Fatalf("currentCell default = %d, want 0", got)
+	}
+	s.ActiveWorkspace = 0 // below range -> clamp up to 0
+	if got := s.currentCell(); got != 0 {
+		t.Fatalf("currentCell(active=0) = %d, want 0", got)
+	}
+	s.ActiveWorkspace = 10 // above range -> clamp to count-1
+	if got := s.currentCell(); got != 3 {
+		t.Fatalf("currentCell(active=10,count=4) = %d, want 3", got)
+	}
+	s.WorkspaceCount = 0 // unknown count -> no upper clamp
+	s.ActiveWorkspace = 5
+	if got := s.currentCell(); got != 4 {
+		t.Fatalf("currentCell(active=5,count=0) = %d, want 4", got)
+	}
+}
+
+// Clicking a pager cell switches to it and fires the host handler with the
+// 1-based workspace index; the pager highlight follows.
+func TestClickWorkspaceFiresHandler(t *testing.T) {
+	s := New(tW, tH)
+	var got int
+	s.SetWorkspaceHandler(func(i int) { got = i })
+	buf := newBuf(s)
+	Render(s, buf) // build + lay out the view
+	// Click the centre of cell index 2 (workspace 3).
+	wx, wy, _, wh := s.WorkspaceRect()
+	cx := wx + 2*(toolkit.WorkspacePagerCellW+toolkit.WorkspacePagerGap) + toolkit.WorkspacePagerCellW/2
+	s.ClickWorkspace(cx, wy+wh/2)
+	if got != 3 {
+		t.Fatalf("handler got workspace %d, want 3", got)
+	}
+	if s.view.pager.Current().Get() != 2 {
+		t.Fatalf("pager current cell = %d, want 2", s.view.pager.Current().Get())
+	}
+}
+
+// A programmatic workspace push (compositor confirming a switch) updates the
+// pager highlight but does NOT echo back through the host handler.
+func TestProgrammaticWorkspaceDoesNotEcho(t *testing.T) {
+	s := New(tW, tH)
+	calls := 0
+	s.SetWorkspaceHandler(func(int) { calls++ })
+	buf := newBuf(s)
+	Render(s, buf)
+	s.SetActiveWorkspace(3) // authoritative model push
+	if calls != 0 {
+		t.Fatalf("programmatic SetActiveWorkspace echoed to handler %d times", calls)
+	}
+	if s.view.pager.Current().Get() != 2 {
+		t.Fatalf("pager did not follow programmatic switch: cell %d, want 2", s.view.pager.Current().Get())
+	}
+}
+
+// With no handler registered a pager cell click is a harmless no-op (the
+// subscriber's nil-handler guard).
+func TestClickWorkspaceNoHandler(t *testing.T) {
+	s := New(tW, tH)
+	buf := newBuf(s)
+	Render(s, buf)
+	wx, wy, _, wh := s.WorkspaceRect()
+	s.ClickWorkspace(wx+toolkit.WorkspacePagerCellW/2, wy+wh/2) // must not panic
+	if s.view.pager.Current().Get() != 0 {
+		t.Fatalf("current cell = %d, want 0", s.view.pager.Current().Get())
 	}
 }
 

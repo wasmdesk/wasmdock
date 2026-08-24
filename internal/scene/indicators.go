@@ -4,21 +4,18 @@ package scene
 
 import (
 	"strings"
-
-	"github.com/go-widgets/painter"
-	"github.com/go-widgets/toolkit"
 )
 
-// Running / active indicators + attention badges.
+// Running / active indicators, attention badges, and workspace occupancy.
 //
 // A launcher whose app has at least one open window carries a small "running"
 // dot centred under its glyph (the macOS/Unity dock convention); the launcher
-// of the currently-focused window additionally gets a brighter, wider active
-// underline. An app can also request an attention badge — a count or alert
-// pill drawn in the launcher's top-right corner via the toolkit's Badge widget
-// — through SetBadge; this is the placeholder API a client uses until a first-
-// class "badge" dock wire message lands (the dock would set it from that
-// message's payload exactly the way SetBadge does).
+// of the currently-focused window additionally gets a brighter active fill. An
+// app can also request an attention badge — a count drawn in the launcher's
+// top-right corner — through SetBadge. All three are drawn by the composed
+// toolkit.AppDock from its AppDockItem flags; this file only computes the
+// per-launcher model that syncView folds onto those items, plus the pager's
+// per-workspace occupancy.
 
 // appIndexForWindow maps an open window to the launcher index it belongs to, or
 // -1 if none matches. The match is by the window's explicit App id when the
@@ -62,7 +59,7 @@ func (s *State) launcherRunning() []bool {
 
 // focusedLauncher returns the launcher index of the currently-focused window,
 // or -1 if no focused window maps to a launcher. Its launcher gets the brighter
-// active underline on top of the running dot.
+// active fill on top of the running dot.
 func (s *State) focusedLauncher() int {
 	for _, w := range s.Windows {
 		if w.Focused {
@@ -72,10 +69,28 @@ func (s *State) focusedLauncher() int {
 	return -1
 }
 
+// workspaceOccupancy reports, per workspace cell (0-based, length
+// WorkspaceCount), whether any open window is assigned to that workspace — the
+// pager draws an occupancy dot on the true cells. A window's Workspace is
+// 1-based; out-of-range or zero values are ignored. Returns nil when the count
+// is non-positive, which the pager reads as "no dots".
+func (s *State) workspaceOccupancy() []bool {
+	if s.WorkspaceCount <= 0 {
+		return nil
+	}
+	out := make([]bool, s.WorkspaceCount)
+	for _, w := range s.Windows {
+		if w.Workspace >= 1 && w.Workspace <= s.WorkspaceCount {
+			out[w.Workspace-1] = true
+		}
+	}
+	return out
+}
+
 // SetBadge sets (count > 0) or clears (count <= 0) the attention badge on the
-// launcher whose Id is app. The badge shows the count, capped at "99+" so the
-// pill stays compact. Unknown app ids are ignored. Placeholder attention API:
-// a client requests a badge through the dock, which calls this and repaints.
+// launcher whose Id is app. Unknown app ids are ignored. Placeholder attention
+// API: a client requests a badge through the dock, which calls this and
+// repaints; the count rides onto the launcher's AppDockItem.Badge in syncView.
 func (s *State) SetBadge(app string, count int) {
 	if s.badges == nil {
 		s.badges = map[string]int{}
@@ -88,57 +103,11 @@ func (s *State) SetBadge(app string, count int) {
 }
 
 // BadgeCount returns the attention-badge count for the launcher app id (0 when
-// none). Exposed so the wasm shell + tests can read back what SetBadge stored.
+// none). Exposed so the wasm shell + tests can read back what SetBadge stored,
+// and read by syncView to drive the dock item's Badge.
 func (s *State) BadgeCount(app string) int {
 	if s.badges == nil {
 		return 0
 	}
 	return s.badges[app]
 }
-
-// badgeText formats a badge count as its pill label, capping large counts at
-// "99+" so a runaway counter cannot widen the pill past its corner.
-func badgeText(n int) string {
-	if n <= 0 {
-		return ""
-	}
-	if n > 99 {
-		return "99+"
-	}
-	return itoa(n)
-}
-
-// drawBadge paints an attention badge pill in the top-right corner of a
-// launcher slot rectangle r via the toolkit Badge widget, or is a no-op when
-// count is zero. The pill hugs the corner so it overhangs the glyph the way a
-// notification count does; its width auto-sizes to the digit count.
-func drawBadge(p painter.Painter, r toolkit.Rect, count int) {
-	txt := badgeText(count)
-	if txt == "" || r.W <= 0 || r.H <= 0 {
-		return
-	}
-	b := toolkit.NewBadge(txt)
-	// Auto-size to the text, then anchor the pill's top-right at the slot's
-	// top-right corner (a 1px inset so the border stays visible).
-	b.SetBounds(toolkit.Rect{X: 0, Y: 0, W: 0, H: 0})
-	b.Draw(p, badgeTheme) // first Draw sizes it; we discard this placement
-	bw := b.Bounds().W
-	bh := b.Bounds().H
-	bx := r.X + r.W - bw - 1
-	by := r.Y + 1
-	if bx < r.X {
-		bx = r.X
-	}
-	b.SetBounds(toolkit.Rect{X: bx, Y: by, W: bw, H: bh})
-	b.Draw(p, badgeTheme)
-}
-
-// badgeTheme supplies the Badge widget's fallback pill + ink colours (a red
-// alert fill with white text) so an attention badge reads as a notification
-// count regardless of the dock's active Openbox theme.
-var badgeTheme = func() *toolkit.Theme {
-	th := toolkit.DefaultLight()
-	th.Accent = toolkit.RGB(0xE0, 0x1B, 0x24)     // alert red pill
-	th.Background = toolkit.RGB(0xFF, 0xFF, 0xFF) // white ink
-	return th
-}()

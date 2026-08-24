@@ -6,7 +6,7 @@ require (
 	github.com/go-iconoir/iconoir v0.2.0
 	github.com/go-widgets/mvvm v0.8.0
 	github.com/go-widgets/painter v0.11.0
-	github.com/go-widgets/toolkit v0.241.0
+	github.com/go-widgets/toolkit v0.247.0
 )
 
 require (
