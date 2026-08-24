@@ -126,21 +126,32 @@ func finishMenu(entries []MenuEntry) DockMenu {
 	return DockMenu{Entries: entries, W: w, H: h}
 }
 
-// toolkitMenu converts the dock menu into a toolkit.Menu with the hovered row
-// highlighted. Selectable entries get a non-nil Action so the widget draws them
-// enabled + hoverable; separators map to Separator rows. The func bodies are
-// empty — the dock routes the real dispatch through MenuHitTest, not the
-// widget's own callback (the popup is paint-only).
+// toolkitMenu converts the dock menu into a bounded toolkit.Menu with the
+// hovered row set on its Hover() observable. Selectable entries get a non-nil
+// Action so the widget draws them enabled + hoverable AND so Menu.RowAt resolves
+// them; separators map to Separator rows and a disabled (ActNone) entry keeps a
+// nil Action so Menu.RowAt reports it as un-hittable — exactly the rows the dock
+// dispatches. The func bodies are empty: the dock routes the real dispatch
+// through MenuHitTest, not the widget's own callback (the popup is paint-only).
+//
+// The menu is bounded to the popup's W x H so its own Menu.RowAt / Hover row
+// math is authoritative — the dock no longer mirrors MenuRowH / body-inset /
+// separator metrics by hand.
 func (m DockMenu) toolkitMenu(hover int) *toolkit.Menu {
 	items := make([]toolkit.MenuItem, 0, len(m.Entries))
 	for _, e := range m.Entries {
-		if e.Separator {
+		switch {
+		case e.Separator:
 			items = append(items, toolkit.MenuItem{Separator: true})
-			continue
+		case e.Action == ActNone:
+			// Disabled row: no Action, so Menu.RowAt returns -1 for it.
+			items = append(items, toolkit.MenuItem{Label: e.Label})
+		default:
+			items = append(items, toolkit.MenuItem{Label: e.Label, Action: func() {}})
 		}
-		items = append(items, toolkit.MenuItem{Label: e.Label, Action: func() {}})
 	}
 	tm := toolkit.NewMenu(items)
+	tm.SetBounds(toolkit.Rect{X: 0, Y: 0, W: m.W, H: m.H})
 	tm.Hover().Set(hover)
 	return tm
 }
@@ -155,35 +166,22 @@ func (m DockMenu) MenuRender(buf []byte, w, h, hover int) {
 	}
 	p := painter.NewPixelPainter(buf, w, h)
 	tm := m.toolkitMenu(hover)
-	tm.SetBounds(toolkit.Rect{X: 0, Y: 0, W: w, H: h})
 	tm.Draw(p, menuTheme)
 }
 
 // MenuHitTest returns the entry index at popup-relative y (x is unused — menu
 // rows span the full width), or -1 for a separator, a disabled row or a click
-// outside any row. Mirrors the toolkit Menu's row layout: a 2px top inset, then
-// each entry consuming MenuRowH (selectable) or MenuSeparatorH (separator).
+// outside any row. It defers to the toolkit Menu's own Menu.RowAt so the popup
+// resolves a click through the SAME row geometry the widget paints (row height,
+// body inset, separator height, scale + touch density) rather than re-deriving
+// it — no hand-rolled row math to drift out of sync.
 func (m DockMenu) MenuHitTest(y int) int {
-	cur := 2
-	for i, e := range m.Entries {
-		if e.Separator {
-			cur += toolkit.MenuSeparatorH
-			continue
-		}
-		if y >= cur && y < cur+toolkit.MenuRowH {
-			if e.Action == ActNone {
-				return -1
-			}
-			return i
-		}
-		cur += toolkit.MenuRowH
-	}
-	return -1
+	return m.toolkitMenu(-1).RowAt(0, y)
 }
 
 // MenuHover returns the entry index that a pointer at popup-relative y hovers,
-// or -1 when it is over a separator / gap. Same layout math as MenuHitTest;
-// used to drive the highlight passed to MenuRender as the pointer moves.
+// or -1 when it is over a separator / gap. Shares Menu.RowAt with MenuHitTest so
+// the highlight passed to MenuRender always tracks the row a click would act on.
 func (m DockMenu) MenuHover(y int) int { return m.MenuHitTest(y) }
 
 // menuTheme is the toolkit Theme the popup menu draws with — the toolkit's
