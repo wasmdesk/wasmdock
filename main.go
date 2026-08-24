@@ -97,8 +97,11 @@ func main() {
 
 	launch := func(app string) { client.Call("launch", app) }
 
-	// setWorkspace asks the compositor to switch the active workspace.
+	// setWorkspace asks the compositor to switch the active workspace. The dock
+	// fires it (with a 1-based index) whenever the user picks a workspace pager
+	// cell; the wheel handler calls it directly to cycle.
 	setWorkspace := func(index int) { client.Call("setWorkspace", index) }
+	state.SetWorkspaceHandler(setWorkspace)
 
 	// Initial paint so the compositor has something to blit immediately, plus a
 	// first geometry publish so a probe can read the resting layout.
@@ -141,11 +144,12 @@ func main() {
 			if b := ev.Get("button"); !b.IsUndefined() && !b.IsNull() {
 				button = b.Int()
 			}
-			// Workspace section: left-click cycles to the next workspace; a
-			// right-click there is reserved for a future workspace menu.
+			// Workspace pager: left-click switches to the clicked cell (the pager
+			// fires setWorkspace through its Current observable); a right-click
+			// there is reserved for a future workspace menu.
 			if state.HitTestWorkspace(x, y) {
 				if button != 2 {
-					setWorkspace(state.NextWorkspace())
+					state.ClickWorkspace(x, y)
 				}
 				break
 			}

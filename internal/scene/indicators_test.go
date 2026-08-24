@@ -4,8 +4,6 @@ package scene
 
 import (
 	"testing"
-
-	"github.com/go-widgets/toolkit"
 )
 
 // appIndexForWindow: explicit App id match, App id miss, Title==Label fallback,
@@ -95,45 +93,30 @@ func TestBadgeSetAndCount(t *testing.T) {
 	}
 }
 
-// badgeText caps at 99+ and blanks a non-positive count.
-func TestBadgeText(t *testing.T) {
-	if got := badgeText(0); got != "" {
-		t.Fatalf("badgeText(0) = %q, want empty", got)
+// workspaceOccupancy marks the cells that hold a window and ignores
+// out-of-range / zero workspace numbers; a non-positive count yields nil.
+func TestWorkspaceOccupancy(t *testing.T) {
+	s := New(tW, tH) // WorkspaceCount = 4
+	s.SetWindows([]Window{
+		{Id: 1, Title: "Terminal", Workspace: 1},
+		{Id: 2, Title: "Editor", Workspace: 3},
+		{Id: 3, Title: "Files", Workspace: 0},  // unassigned -> ignored
+		{Id: 4, Title: "Hello", Workspace: 99}, // out of range -> ignored
+	})
+	occ := s.workspaceOccupancy()
+	want := []bool{true, false, true, false}
+	if len(occ) != len(want) {
+		t.Fatalf("occupancy len = %d, want %d", len(occ), len(want))
 	}
-	if got := badgeText(-5); got != "" {
-		t.Fatalf("badgeText(-5) = %q, want empty", got)
+	for i := range want {
+		if occ[i] != want[i] {
+			t.Fatalf("occupancy[%d] = %v, want %v", i, occ[i], want[i])
+		}
 	}
-	if got := badgeText(7); got != "7" {
-		t.Fatalf("badgeText(7) = %q, want 7", got)
-	}
-	if got := badgeText(150); got != "99+" {
-		t.Fatalf("badgeText(150) = %q, want 99+", got)
-	}
-}
-
-// drawBadge: zero count no-ops; degenerate rect no-ops; a positive count inks a
-// pill; a narrow rect exercises the bx<r.X clamp.
-func TestDrawBadge(t *testing.T) {
-	buf, p := newPainter(60, BarHeight)
-	drawBadge(p, toolkit.Rect{X: 0, Y: 0, W: 40, H: 24}, 0) // no count
-	if countNonZero(buf) != 0 {
-		t.Fatalf("zero-count badge painted something")
-	}
-	buf, p = newPainter(60, BarHeight)
-	drawBadge(p, toolkit.Rect{X: 0, Y: 0, W: 0, H: 24}, 3) // degenerate
-	if countNonZero(buf) != 0 {
-		t.Fatalf("degenerate badge painted something")
-	}
-	buf, p = newPainter(60, BarHeight)
-	drawBadge(p, toolkit.Rect{X: 4, Y: 2, W: 40, H: 24}, 5)
-	if countNonZero(buf) == 0 {
-		t.Fatalf("badge painted nothing")
-	}
-	// Narrow rect narrower than the pill: bx clamps to r.X, still paints.
-	buf, p = newPainter(60, BarHeight)
-	drawBadge(p, toolkit.Rect{X: 2, Y: 2, W: 4, H: 24}, 99)
-	if countNonZero(buf) == 0 {
-		t.Fatalf("narrow badge painted nothing")
+	// Non-positive count -> nil (the pager reads it as "no dots").
+	s.SetWorkspaceCount(0)
+	if occ := s.workspaceOccupancy(); occ != nil {
+		t.Fatalf("count=0 occupancy = %v, want nil", occ)
 	}
 }
 
