@@ -49,10 +49,14 @@ if ! grep -qF "$ANCHOR" "$TARGET"; then
   exit 3
 fi
 
+# Restore the target ONLY once a real backup has been taken (RESTORE=1) and it
+# is non-empty, so a failure before the cp below cannot make the trap copy an
+# empty temp over $TARGET and wipe it.
 BACKUP="$(mktemp)"
-cp "$TARGET" "$BACKUP"
-restore() { cp "$BACKUP" "$TARGET"; rm -f "$BACKUP"; }
+RESTORE=0
+restore() { [ "$RESTORE" = 1 ] && [ -s "$BACKUP" ] && cp "$BACKUP" "$TARGET"; rm -f "$BACKUP"; return 0; }
 trap restore EXIT
+cp "$TARGET" "$BACKUP"; RESTORE=1
 
 # guard runs the analyzer and returns its exit code (0 = clean, non-0 = flagged).
 guard() {
