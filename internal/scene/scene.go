@@ -668,5 +668,6 @@ func drawGlyph(p painter.Painter, g Glyph, r toolkit.Rect, ink toolkit.RGBA) {
 	if stem := glyphStem(g); stem != "" && iconoir.Draw(p, r, stem, ink) {
 		return
 	}
+	//bricolint:allow icon-paint leaf: last-resort solid square for a glyph iconoir does not carry, so the AppDockItem.Icon slot stays visible (primary path is iconoir.Draw above); the toolkit delegates icon painting to this func(painter.Painter,…) callback.
 	p.FillRect(r, ink)
 }
