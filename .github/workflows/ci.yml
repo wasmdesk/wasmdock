@@ -57,3 +57,26 @@ jobs:
 
       - name: Native scene + theme tests
         run: go test -count=1 ./...
+
+  bricolint:
+    name: Guard against hand-drawn UI
+    runs-on: ubuntu-latest
+    env:
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+          check-latest: true
+          cache: true
+
+      - name: Install bricolint
+        run: go install github.com/go-widgets/bricolint/cmd/bricolint@v0.1.0
+
+      - name: Guard against hand-drawn UI
+        run: go vet -vettool="$(go env GOPATH)/bin/bricolint" ./...
+
+      - name: Negative control (the guard must bite)
+        run: BRICOLINT="$(go env GOPATH)/bin/bricolint" bash hack/bricolint-negative-control.sh
