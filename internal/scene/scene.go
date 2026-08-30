@@ -50,7 +50,7 @@ package scene
 import (
 	"time"
 
-	"github.com/go-iconoir/iconoir"
+	icons "github.com/go-icons/iconoir"
 	"github.com/go-widgets/painter"
 	"github.com/go-widgets/toolkit"
 	"github.com/wasmdesk/wasmdock/internal/theme"
@@ -658,14 +658,15 @@ func glyphStem(g Glyph) string {
 	}
 }
 
-// drawGlyph paints one launcher's icon mark into r via iconoir.Draw. A
-// non-positive rect is a no-op; an unknown glyph (no stem, or a stem iconoir
+// drawGlyph paints one launcher's icon mark into r via toolkit.DrawIconoir. A
+// non-positive rect is a no-op; an unknown glyph (no stem, or a stem the set
 // does not carry) paints a solid square so the slot stays visible.
 func drawGlyph(p painter.Painter, g Glyph, r toolkit.Rect, ink toolkit.RGBA) {
 	if r.W <= 0 || r.H <= 0 {
 		return
 	}
-	if stem := glyphStem(g); stem != "" && iconoir.Draw(p, r, stem, ink) {
+	if stem := glyphStem(g); stem != "" && icons.Has(stem) {
+		toolkit.DrawIconoir(p, r, stem, ink)
 		return
 	}
 	p.FillRect(r, ink)
