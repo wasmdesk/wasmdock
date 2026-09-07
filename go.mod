@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/go-icons/iconoir v0.2.0
 	github.com/go-widgets/painter v0.13.0
-	github.com/go-widgets/toolkit v0.313.0
+	github.com/go-widgets/toolkit v0.316.0
 )
 
 require (
