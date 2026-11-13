@@ -4,8 +4,8 @@ go 1.27.2
 
 require (
 	github.com/go-icons/iconoir v0.3.0
-	github.com/go-widgets/painter v0.17.0
-	github.com/go-widgets/toolkit v0.356.0
+	github.com/go-widgets/painter v0.17.1
+	github.com/go-widgets/toolkit v0.374.11
 )
 
 require (
@@ -20,4 +20,5 @@ require (
 	github.com/go-typeset/bidi v0.3.1 // indirect
 	github.com/go-widgets/mvvm v0.15.0 // indirect
 	github.com/go-widgets/textinput v0.1.0 // indirect
+	github.com/go-widgets/vcs v0.1.0 // indirect
 )
